@@ -326,10 +326,11 @@ static LIVE: Mutex<()> = Mutex::new(());
 /// Point the session at the worker built into this profile's folder.
 fn worker_available() -> bool {
     let name = if cfg!(windows) { "jj1-view.exe" } else { "jj1-view" };
-    // target/<profile>/deps/e2e-xxxx -> target/<profile>/jj1-view
+    // The test binary sits somewhere below target/<profile>/ (the exact depth
+    // depends on the cargo version); the worker sits directly in it.
     let path: Option<PathBuf> = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().and_then(|deps| deps.parent()).map(|dir| dir.join(name)));
+        .and_then(|exe| exe.ancestors().skip(1).take(6).map(|dir| dir.join(name)).find(|p| p.exists()));
     match path {
         Some(p) if p.exists() => {
             std::env::set_var("JJ1_VIEW_WORKER", &p);
