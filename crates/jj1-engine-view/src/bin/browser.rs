@@ -188,7 +188,10 @@ header b{font-size:15px}
 header button{border:1px solid var(--line);background:none;color:var(--fg);border-radius:14px;padding:3px 11px;font:inherit;font-size:12px;cursor:pointer}
 header button:hover{background:rgba(127,127,127,.16)}
 #log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:11px}
-.msg{max-width:94%;padding:9px 13px;border-radius:14px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}
+.msg{position:relative;max-width:94%;padding:9px 13px;border-radius:14px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}
+.del{position:absolute;top:-8px;right:-7px;width:22px;height:22px;border:0;border-radius:50%;background:rgba(44,48,56,.8);color:#fff;font-size:13px;line-height:22px;text-align:center;cursor:pointer;padding:0;opacity:.45;transition:opacity .12s,background .12s;box-shadow:0 2px 8px rgba(0,0,0,.3)}
+.msg:hover .del{opacity:1}
+.del:hover{opacity:1;background:#c0453a}
 .me{align-self:flex-end;background:var(--me);color:#fff;border-bottom-right-radius:5px;box-shadow:0 2px 12px color-mix(in srgb,var(--me) 40%,transparent)}
 .bot{align-self:flex-start;background:var(--bot);border-bottom-left-radius:5px;box-shadow:0 2px 12px rgba(30,40,60,.08)}
 .err{border:1px solid #d9534f}
@@ -234,23 +237,36 @@ function render(md){
   return out;
 }
 function near(){return log.scrollHeight-log.scrollTop-log.clientHeight<150;}
-function add(cls,html){var e=document.getElementById('empty');if(e)e.remove();var d=document.createElement('div');d.className=cls;d.innerHTML=html;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
+function delIndex(d){var all=[].slice.call(log.querySelectorAll('.hx'));return all.indexOf(d);}
+// Returns the CONTENT node (so streaming can rewrite it without wiping the delete button).
+function add(cls,html){
+  var e=document.getElementById('empty');if(e)e.remove();
+  var d=document.createElement('div');d.className=cls;
+  var c=document.createElement('div');c.className='c';c.innerHTML=html;d.appendChild(c);
+  if(/\bhx\b/.test(cls)){
+    var del=document.createElement('button');del.className='del';del.textContent='×';del.title='Delete this exchange and free its tokens';
+    del.onclick=function(ev){ev.stopPropagation();if(busy)return;var i=delIndex(d);if(i>=0)post({c:'delete',i:i});};
+    d.appendChild(del);
+  }
+  log.appendChild(d);log.scrollTop=log.scrollHeight;return c;
+}
 function setBusy(b){busy=b;btn.textContent=b?'Stop':'Send';btn.classList.toggle('stop',b);}
 function grow(){box.style.height='42px';box.style.height=Math.min(Math.max(box.scrollHeight,42),160)+'px';}
 function k(n){return n>=1000?(n/1000).toFixed(1)+'k':String(n);}
 function submit(){
   if(busy){post({c:'stop'});st.textContent='Stopping...';return;}
   var t=box.value.trim(); if(!t)return;
-  add('msg me',esc(t)); box.value=''; grow();
+  add('msg me hx',esc(t)); box.value=''; grow();
   cur=null; curText=''; answered=false; setBusy(true); st.textContent='Starting...';
   post({c:'send',v:t});
 }
 window.deuriEvent=function(e){
   if(e.t==='status'){st.textContent=e.v;}
-  else if(e.t==='delta'){var stick=near(); if(!cur){cur=add('msg bot','');curText='';} curText+=e.v; answered=true; cur.innerHTML=render(curText); st.textContent=''; if(stick)log.scrollTop=log.scrollHeight;}
-  else if(e.t==='step'){cur=null; var s=add('step',''); s.textContent='\u21B3 '+e.v;}
+  else if(e.t==='delta'){var stick=near(); if(!cur){cur=add('msg bot hx','');curText='';} curText+=e.v; answered=true; cur.innerHTML=render(curText); st.textContent=''; if(stick)log.scrollTop=log.scrollHeight;}
+  else if(e.t==='step'){cur=null; add('step','').textContent='\u21B3 '+e.v;}
   else if(e.t==='done'){setBusy(false); st.textContent=''; if(!answered)add('msg bot','<i>(no answer)</i>'); cur=null; if(e.used>0)ctx.textContent='Context used: ~'+k(e.used)+' of '+k(e.ctx)+' tokens';}
   else if(e.t==='error'){setBusy(false); st.textContent=''; cur=null; add('msg bot err',esc(e.v));}
+  else if(e.t==='history'){ cur=null; log.innerHTML=''; if(e.msgs&&e.msgs.length){ e.msgs.forEach(function(m){ add(m.role==='me'?'msg me hx':'msg bot hx', m.role==='me'?esc(m.text):render(m.text)); }); } else { log.innerHTML=EMPTY; } ctx.textContent=(e.used>0)?('Context used: ~'+k(e.used)+' of '+k(e.ctx)+' tokens'):''; }
 };
 window.setModel=function(m){document.getElementById('model').textContent=m;};
 window.focusBox=function(){box.focus();};
@@ -1091,6 +1107,23 @@ fn main() {
                     "reset" => {
                         if !deuri_busy {
                             history.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                        }
+                    }
+                    "delete" => {
+                        // Remove one exchange from the conversation and tell the
+                        // panel the new transcript and token count.
+                        if !deuri_busy {
+                            let index = cmd["i"].as_u64().unwrap_or(u64::MAX) as usize;
+                            let (msgs, used) = {
+                                let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
+                                let used = deuri::delete_exchange(&mut h, index);
+                                (deuri::transcript(&h), used)
+                            };
+                            if let Some(p) = &panel {
+                                let ctx = deuri::Settings::load(&config_dir()).context_length;
+                                let v = json!({"t": "history", "msgs": msgs, "used": used, "ctx": ctx});
+                                let _ = p.evaluate_script(&format!("window.deuriEvent&&window.deuriEvent({v})"));
+                            }
                         }
                     }
                     "open" => queue.push(json!({"c": "open", "v": cmd["v"]})),

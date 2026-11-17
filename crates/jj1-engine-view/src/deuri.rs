@@ -41,6 +41,17 @@ pub struct Settings {
     pub lms_path: String,
     /// Unload the model when the browser closes (if Deuri loaded or used it).
     pub unload_on_exit: bool,
+    /// Fraction of the model's layers to put on the GPU (0..1). For Bonsai 2
+    /// (64 layers) 0.703125 = 45 layers.
+    pub gpu_offload_ratio: f64,
+    /// K/V cache quantization type: "q8_0", "q4_0", or "" / "f16" for none.
+    /// Quantization shrinks the memory a long context needs. Needs flash attention.
+    pub kv_cache_quant: String,
+    /// Flash attention (required for quantized K/V cache).
+    pub flash_attention: bool,
+    /// LM Studio's home folder; empty = ~/.lmstudio. Used to write the model's
+    /// load config (context, offload, cache quant), which the CLI has no flags for.
+    pub lmstudio_home: String,
 }
 
 impl Default for Settings {
@@ -48,7 +59,7 @@ impl Default for Settings {
         Settings {
             model: "bonsai-2-27b-ternary-crack".into(),
             identifier: "deuri".into(),
-            context_length: 30_000,
+            context_length: 100_000,
             idle_unload_secs: 600,
             server: "http://127.0.0.1:1234".into(),
             // Includes the model's hidden "thinking" tokens.
@@ -56,6 +67,10 @@ impl Default for Settings {
             temperature: 0.6,
             lms_path: String::new(),
             unload_on_exit: true,
+            gpu_offload_ratio: 0.703125,
+            kv_cache_quant: "q8_0".into(),
+            flash_attention: true,
+            lmstudio_home: String::new(),
         }
     }
 }
@@ -80,6 +95,10 @@ impl Settings {
                     s.max_reply_tokens = v["max_reply_tokens"].as_u64().map(|n| n as usize).unwrap_or(s.max_reply_tokens);
                     s.temperature = v["temperature"].as_f64().unwrap_or(s.temperature);
                     s.unload_on_exit = v["unload_on_exit"].as_bool().unwrap_or(s.unload_on_exit);
+                    s.gpu_offload_ratio = v["gpu_offload_ratio"].as_f64().unwrap_or(s.gpu_offload_ratio).clamp(0.0, 1.0);
+                    s.kv_cache_quant = str_of("kv_cache_quant", &s.kv_cache_quant);
+                    s.flash_attention = v["flash_attention"].as_bool().unwrap_or(s.flash_attention);
+                    s.lmstudio_home = str_of("lmstudio_home", &s.lmstudio_home);
                 }
             }
             Err(_) => {
@@ -96,7 +115,22 @@ impl Settings {
             "idle_unload_secs": self.idle_unload_secs, "server": self.server,
             "max_reply_tokens": self.max_reply_tokens, "temperature": self.temperature, "lms_path": self.lms_path,
             "unload_on_exit": self.unload_on_exit,
+            "gpu_offload_ratio": self.gpu_offload_ratio, "kv_cache_quant": self.kv_cache_quant,
+            "flash_attention": self.flash_attention, "lmstudio_home": self.lmstudio_home,
         })
+    }
+
+    fn home(&self) -> PathBuf {
+        if !self.lmstudio_home.is_empty() {
+            return PathBuf::from(&self.lmstudio_home);
+        }
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
+        home.unwrap_or_default().join(".lmstudio")
+    }
+
+    fn quant_on(&self) -> bool {
+        let q = self.kv_cache_quant.to_ascii_lowercase();
+        !q.is_empty() && q != "off" && q != "none" && q != "f16"
     }
 
     fn lms(&self) -> Result<PathBuf, String> {
@@ -169,6 +203,84 @@ fn loaded_context(settings: &Settings) -> Result<Option<u64>, String> {
     }))
 }
 
+/// LM Studio's model key for a model folder: the folder name, lower-cased,
+/// with a trailing "-gguf" removed (`Bonsai-2-27B-Ternary-CRACK-GGUF` ->
+/// `bonsai-2-27b-ternary-crack`).
+fn folder_key(folder: &str) -> String {
+    let lower = folder.to_ascii_lowercase();
+    lower.strip_suffix("-gguf").unwrap_or(&lower).to_string()
+}
+
+/// Find a file ending in `suffix` under `root`, at most `depth` levels deep,
+/// whose immediate parent folder matches the model key.
+fn find_matching(root: &std::path::Path, key: &str, suffix: &str, depth: usize) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if depth > 0 {
+                if let Some(found) = find_matching(&path, key, suffix, depth - 1) {
+                    return Some(found);
+                }
+            }
+        } else if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(suffix)) {
+            let parent = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("");
+            if folder_key(parent) == key {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Path of LM Studio's per-model load-config file for this model. Prefers an
+/// existing one; otherwise mirrors the model's own `.gguf` path into the
+/// config tree (the CLI has no flags for cache quant or a context this large,
+/// but it reads this file).
+fn model_config_path(settings: &Settings) -> Result<PathBuf, String> {
+    let home = settings.home();
+    let config_root = home.join(".internal").join("user-concrete-model-default-config");
+    let key = settings.model.to_ascii_lowercase();
+    if let Some(p) = find_matching(&config_root, &key, ".gguf.json", 3) {
+        return Ok(p);
+    }
+    let models = home.join("models");
+    let gguf = find_matching(&models, &key, ".gguf", 3)
+        .ok_or_else(|| format!("could not find the model \"{}\" under {}", settings.model, models.display()))?;
+    let rel = gguf.strip_prefix(&models).map_err(|e| e.to_string())?;
+    let mut p = config_root.join(rel);
+    let name = format!("{}.json", p.file_name().and_then(|n| n.to_str()).unwrap_or("model.gguf"));
+    p.set_file_name(name);
+    Ok(p)
+}
+
+/// Write LM Studio's load config for the model: context length, GPU offload
+/// ratio, flash attention and K/V cache quantization. Written as UTF-8 with no
+/// BOM, which LM Studio requires. Returns the file written.
+fn write_model_config(settings: &Settings) -> Result<PathBuf, String> {
+    let path = model_config_path(settings)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let quant_on = settings.quant_on();
+    let cache_value = if quant_on { settings.kv_cache_quant.as_str() } else { "f16" };
+    let doc = json!({
+        "preset": "",
+        "operation": {"fields": []},
+        "load": {"fields": [
+            {"key": "llm.load.contextLength", "value": settings.context_length},
+            {"key": "llm.load.llama.acceleration.offloadRatio", "value": settings.gpu_offload_ratio},
+            {"key": "llm.load.llama.flashAttention", "value": settings.flash_attention || quant_on},
+            {"key": "llm.load.llama.kCacheQuantizationType", "value": {"checked": quant_on, "value": cache_value}},
+            {"key": "llm.load.llama.vCacheQuantizationType", "value": {"checked": quant_on, "value": cache_value}},
+        ]},
+    });
+    // to_string -> UTF-8, no BOM.
+    std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap_or_default())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// Make sure the server runs and the model is loaded with the configured
 /// context length. Does nothing if that is already the case.
 pub fn ensure_loaded(settings: &Settings, emit: &dyn Fn(Event)) -> Result<(), String> {
@@ -197,21 +309,46 @@ pub fn ensure_loaded(settings: &Settings, emit: &dyn Fn(Event)) -> Result<(), St
         }
         None => {}
     }
-    emit(Event::Status(format!("Loading {} ({}k context)...", settings.model, settings.context_length / 1000)));
-    run_lms(
-        settings,
-        &[
-            "load",
-            &settings.model,
-            "--context-length",
-            &settings.context_length.to_string(),
-            "--ttl",
-            &settings.idle_unload_secs.to_string(),
-            "--identifier",
-            &settings.identifier,
-            "-y",
-        ],
-    )?;
+    let quant = if settings.quant_on() { format!(", {} K/V cache", settings.kv_cache_quant) } else { String::new() };
+    emit(Event::Status(format!(
+        "Loading {} ({}k context{quant})...",
+        settings.model,
+        settings.context_length / 1000
+    )));
+    let ttl = settings.idle_unload_secs.to_string();
+    // The CLI has no flags for cache quant, a context this large, or a GPU
+    // layer ratio beyond the defaults, so write LM Studio's per-model config
+    // and let `lms load` read it. Fall back to the context-length flag alone
+    // if the config cannot be written.
+    let args: Vec<String> = match write_model_config(settings) {
+        Ok(_) => vec!["load".into(), settings.model.clone(), "--ttl".into(), ttl, "--identifier".into(), settings.identifier.clone(), "-y".into()],
+        Err(e) => {
+            emit(Event::Status(format!("(could not set cache quantization: {e})")));
+            vec![
+                "load".into(),
+                settings.model.clone(),
+                "--context-length".into(),
+                settings.context_length.to_string(),
+                "--ttl".into(),
+                ttl,
+                "--identifier".into(),
+                settings.identifier.clone(),
+                "-y".into(),
+            ]
+        }
+    };
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_lms(settings, &refs)?;
+
+    // Confirm the big context actually took; if not, say so instead of silently
+    // running at LM Studio's small default.
+    if let Ok(Some(ctx)) = loaded_context(settings) {
+        if ctx + ctx / 10 < wanted {
+            emit(Event::Status(format!(
+                "note: loaded with {ctx} tokens of context, not {wanted}. Check the model's config in LM Studio."
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -224,6 +361,53 @@ fn message_tokens(m: &Value) -> usize {
 
 pub fn history_tokens(history: &[Value]) -> usize {
     history.iter().map(message_tokens).sum()
+}
+
+/// Is this history entry shown in the chat panel? (user, or an assistant
+/// message that has visible text). The system message and tool results are not.
+fn is_bubble(m: &Value) -> bool {
+    match m["role"].as_str().unwrap_or("") {
+        "user" => true,
+        "assistant" => !m["content"].as_str().unwrap_or("").is_empty(),
+        _ => false,
+    }
+}
+
+/// The visible transcript: `{role: "me"|"bot", text}` for each shown message.
+pub fn transcript(history: &[Value]) -> Vec<Value> {
+    history
+        .iter()
+        .filter(|m| is_bubble(m))
+        .map(|m| {
+            let role = if m["role"] == "user" { "me" } else { "bot" };
+            json!({"role": role, "text": m["content"].as_str().unwrap_or("")})
+        })
+        .collect()
+}
+
+/// Delete the exchange the visible bubble `index` belongs to: its user message
+/// and every following assistant/tool message up to the next user message. The
+/// system message is never touched. Returns the new estimated token total, so
+/// the panel can show the tokens freed.
+pub fn delete_exchange(history: &mut Vec<Value>, index: usize) -> u64 {
+    let target = history.iter().enumerate().filter(|(_, m)| is_bubble(m)).nth(index).map(|(i, _)| i);
+    if let Some(i) = target {
+        // Walk back to the user message that opened this turn.
+        let mut start = i;
+        while start > 1 && history[start]["role"] != "user" {
+            start -= 1;
+        }
+        // Only delete a clean turn that starts at a user message (never the
+        // system message at index 0).
+        if start >= 1 && history[start]["role"] == "user" {
+            let mut end = start + 1;
+            while end < history.len() && history[end]["role"] != "user" {
+                end += 1;
+            }
+            history.drain(start..end);
+        }
+    }
+    history_tokens(history) as u64
 }
 
 /// Shrink the conversation to fit `budget` tokens. The system message (index
@@ -561,7 +745,51 @@ mod tests {
     #[test]
     fn settings_defaults() {
         let s = Settings::default();
-        assert_eq!(s.context_length, 30_000);
+        assert_eq!(s.context_length, 100_000);
         assert_eq!(s.model, "bonsai-2-27b-ternary-crack");
+        assert_eq!(s.gpu_offload_ratio, 0.703125); // 45 of 64 layers
+        assert_eq!(s.kv_cache_quant, "q8_0");
+        assert!(s.quant_on());
+        assert!(!Settings { kv_cache_quant: "f16".into(), ..Settings::default() }.quant_on());
+    }
+
+    #[test]
+    fn model_key_from_folder() {
+        assert_eq!(folder_key("Bonsai-2-27B-Ternary-CRACK-GGUF"), "bonsai-2-27b-ternary-crack");
+        assert_eq!(folder_key("Qwen2.5-Coder-14B-Instruct-GGUF"), "qwen2.5-coder-14b-instruct");
+        assert_eq!(folder_key("plain-folder"), "plain-folder");
+    }
+
+    #[test]
+    fn transcript_and_delete() {
+        let mut h = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "one"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "a"}]}),
+            json!({"role": "tool", "tool_call_id": "a", "content": "page text"}),
+            json!({"role": "assistant", "content": "answer one"}),
+            json!({"role": "user", "content": "two"}),
+            json!({"role": "assistant", "content": "answer two"}),
+        ];
+        // Visible transcript: me "one", bot "answer one", me "two", bot "answer two".
+        let t = transcript(&h);
+        assert_eq!(t.len(), 4);
+        assert_eq!(t[0], json!({"role": "me", "text": "one"}));
+        assert_eq!(t[1], json!({"role": "bot", "text": "answer one"}));
+        assert_eq!(t[3], json!({"role": "bot", "text": "answer two"}));
+
+        // Delete bubble 1 (bot "answer one") -> removes the whole first exchange
+        // (user "one", its tool call, tool result, assistant answer), system kept.
+        delete_exchange(&mut h, 1);
+        let t = transcript(&h);
+        assert_eq!(t, vec![json!({"role": "me", "text": "two"}), json!({"role": "bot", "text": "answer two"})]);
+        assert_eq!(h[0]["role"], "system");
+        assert_eq!(h.len(), 3);
+
+        // Delete the remaining exchange by its user bubble (index 0).
+        delete_exchange(&mut h, 0);
+        assert_eq!(transcript(&h).len(), 0);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0]["role"], "system");
     }
 }

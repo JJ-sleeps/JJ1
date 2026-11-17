@@ -368,6 +368,37 @@ installed here); no streaming of the model's hidden "thinking" tokens (shown as
 reply budget (`max_reply_tokens`, 3000) counts thinking tokens, so a long
 chain of thought can exhaust it (handled with a clear message, not a hang).
 
+### 2026-11-17 - Deuri: 100k context, cache quantization, deletable history
+
+Three changes, verified live against Bonsai 2:
+
+- **100,000-token context** (was 30k). `lms load` only takes a context flag,
+  not a large-context/cache config, so Deuri now writes LM Studio's per-model
+  load config file (`~/.lmstudio/.internal/user-concrete-model-default-config/
+  <publisher>/<model>/<gguf>.json`, UTF-8 **no BOM** — a BOM makes LM Studio
+  ignore it) and lets `lms load` read it. Confirmed: loads at 100,096 tokens.
+- **K/V cache quantization + flash attention + GPU offload.** The config sets
+  `kCacheQuantizationType`/`vCacheQuantizationType` to `q8_0`, `flashAttention`
+  true (required for quantized cache), and `acceleration.offloadRatio` to
+  **0.703125 = 45 of Bonsai 2's 64 layers** ("45 GPU offloads"). New
+  `deuri.json` keys: `gpu_offload_ratio`, `kv_cache_quant` ("q8_0" / "q4_0" /
+  "f16" for off), `flash_attention`, `lmstudio_home`.
+- **Deletable chat history.** Each message has a delete button; deleting one
+  removes that whole question-and-answer exchange from the context and the
+  token meter drops. Verified: deleting a reply took the context from ~754 to
+  ~220 tokens. The model's required `assistant`/`tool` message pairing stays
+  valid because deletion always removes a complete turn. New `deuri::transcript`
+  and `deuri::delete_exchange`, unit-tested.
+
+Config-file location is by a heuristic: the model's folder name, lower-cased
+with a trailing "-gguf" removed, equals the LM Studio model key (true for
+Bonsai 2 and the Qwen models here). If the model's folder can't be found,
+Deuri falls back to loading with just the context-length flag and says cache
+quantization couldn't be set. GPU offload is a *ratio* because that's all
+LM Studio's config exposes; 0.703125 is 45/64 for this model — change it for
+a model with a different layer count. The existing `deuri.json` (which had the
+old 30k) was rewritten to the new values so it takes effect without editing.
+
 ### 2026-11-17 - Browser polish: windows, favicons, extensions, premium look
 
 A batch of human-mode (H1/H2) work on `jj1-browser`, all verified by driving

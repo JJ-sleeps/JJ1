@@ -92,14 +92,23 @@ machine. Deuri can read the page you are on, find things on it, search the web
 and open pages, all in your active tab.
 
 The model is loaded **only when you send your first message** (not when the
-browser starts), given a 30k-token context, and unloaded when it sits idle or
-when you close the browser. Settings live in `%APPDATA%\jj1\deuri.json`
-(model name, context length, server URL, idle timeout):
+browser starts), and unloaded when it sits idle or when you close the browser.
+Each message has a **delete button** — removing one drops that whole exchange
+from the context, so you get its tokens back (the meter at the bottom shows how
+much of the window is used).
+
+Settings live in `%APPDATA%\jj1\deuri.json`. Deuri loads the model with a
+**100k-token context**, **q8_0 K/V cache quantization** (with flash attention),
+and a **GPU offload ratio** of 0.703125 — that is **45 of Bonsai 2's 64 layers**.
+Because `lms` has no flags for these, Deuri writes LM Studio's per-model load
+config; change the ratio if your model has a different layer count.
 
 ```json
 { "model": "bonsai-2-27b-ternary-crack", "identifier": "deuri",
-  "context_length": 30000, "idle_unload_secs": 600,
-  "server": "http://127.0.0.1:1234" }
+  "context_length": 100000, "idle_unload_secs": 600,
+  "server": "http://127.0.0.1:1234",
+  "gpu_offload_ratio": 0.703125, "kv_cache_quant": "q8_0",
+  "flash_attention": true }
 ```
 
 To use it: install LM Studio, download a chat model (Deuri works best with a
