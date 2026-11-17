@@ -16,13 +16,15 @@
 //!
 //! Stdout carries the protocol; diagnostics go to stderr.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use jj1_net::{host_matches, points_to_private_network};
 use serde_json::{json, Value};
+use url::Url;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -184,46 +186,131 @@ struct Rules {
     allow: Vec<String>,
     deny: Vec<String>,
     blocked: Vec<String>,
+    allow_private: bool,
+    block_media: bool,
     /// Navigations refused since the last reply.
     refused: Vec<String>,
+    /// host -> points into a private network (cached lookups).
+    private_cache: HashMap<String, bool>,
+    /// Sub-resource requests blocked since the last reply.
+    resources_blocked: u32,
 }
 
-fn host_matches(host: &str, entry: &str) -> bool {
-    host == entry
-        || (host.len() > entry.len() && host.ends_with(entry) && host[..host.len() - entry.len()].ends_with('.'))
-}
-
-/// `scheme://host...` -> (scheme, lower-case host without port).
-fn scheme_host(url: &str) -> (String, String) {
-    let (scheme, rest) = match url.split_once(':') {
-        Some((s, r)) => (s.to_ascii_lowercase(), r),
-        None => (String::new(), url),
-    };
-    let rest = rest.trim_start_matches('/');
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit('@').next().unwrap_or("");
-    let host = if host.starts_with('[') { host } else { host.split(':').next().unwrap_or("") };
-    (scheme, host.to_ascii_lowercase())
+/// What kind of thing a sub-resource request is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResourceKind {
+    /// Images, audio/video and fonts: never needed to read or act on a page.
+    Media,
+    Other,
 }
 
 impl Rules {
+    fn is_private(&mut self, url: &Url) -> bool {
+        if self.allow_private {
+            return false;
+        }
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        if let Some(p) = self.private_cache.get(&host) {
+            return *p;
+        }
+        let p = points_to_private_network(url);
+        self.private_cache.insert(host, p);
+        p
+    }
+
     /// Top-level navigation gate. Mirrors the core's policy and blocklist.
-    fn permits(&mut self, url: &str) -> bool {
-        let (scheme, host) = scheme_host(url);
-        let ok = match scheme.as_str() {
-            "about" => true,
-            "http" | "https" => {
-                !self.blocked.iter().any(|b| host_matches(&host, b))
-                    && !self.deny.iter().any(|d| host_matches(&host, d))
-                    && (self.allow.is_empty() || self.allow.iter().any(|a| host_matches(&host, a)))
-            }
-            _ => false,
+    fn permits(&mut self, raw: &str) -> bool {
+        let ok = match Url::parse(raw) {
+            Ok(url) => match url.scheme() {
+                "about" => true,
+                "http" | "https" => {
+                    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+                    !self.blocked.iter().any(|b| host_matches(&host, b))
+                        && !self.deny.iter().any(|d| host_matches(&host, d))
+                        && (self.allow.is_empty() || self.allow.iter().any(|a| host_matches(&host, a)))
+                        && !self.is_private(&url)
+                }
+                _ => false,
+            },
+            Err(_) => false,
         };
         if !ok {
-            self.refused.push(url.chars().take(200).collect());
+            self.refused.push(raw.chars().take(200).collect());
         }
         ok
     }
+
+    /// Should this sub-resource request be refused? Applies only when
+    /// `block_media` is on: media and fonts are skipped, and so is anything
+    /// from a blocklisted or denied host (trackers, ads).
+    fn blocks_resource(&mut self, kind: ResourceKind, raw: &str) -> bool {
+        if !self.block_media {
+            return false;
+        }
+        let block = kind == ResourceKind::Media
+            || match Url::parse(raw) {
+                Ok(url) if matches!(url.scheme(), "http" | "https") => {
+                    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+                    self.blocked.iter().any(|b| host_matches(&host, b)) || self.deny.iter().any(|d| host_matches(&host, d))
+                }
+                _ => false,
+            };
+        if block {
+            self.resources_blocked += 1;
+        }
+        block
+    }
+}
+
+/// Intercept every request the page makes (WebView2 only) and answer the ones
+/// the rules refuse with an empty 403, so they never hit the network.
+#[cfg(windows)]
+fn install_resource_filter(webview: &WebView, rules: Arc<Mutex<Rules>>) -> Result<(), String> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_MEDIA,
+    };
+    use webview2_com::WebResourceRequestedEventHandler;
+    use windows::core::{w, PWSTR};
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let env = webview.environment();
+    unsafe {
+        core.AddWebResourceRequestedFilter(w!("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
+            .map_err(|e| e.to_string())?;
+        let handler = WebResourceRequestedEventHandler::create(Box::new(move |_sender, args| {
+            let Some(args) = args else { return Ok(()) };
+            let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
+            args.ResourceContext(&mut context)?;
+            let request = args.Request()?;
+            let mut uri = PWSTR::null();
+            request.Uri(&mut uri)?;
+            let url = webview2_com::take_pwstr(uri);
+            let kind = if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE
+                || context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_MEDIA
+                || context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT
+            {
+                ResourceKind::Media
+            } else {
+                ResourceKind::Other
+            };
+            let block = rules.lock().map(|mut r| r.blocks_resource(kind, &url)).unwrap_or(false);
+            if block {
+                let response = env.CreateWebResourceResponse(None, 403, w!("Blocked by JJ1"), w!(""))?;
+                args.SetResponse(&response)?;
+            }
+            Ok(())
+        }));
+        let mut token = Default::default();
+        core.add_WebResourceRequested(&handler, &mut token).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn install_resource_filter(_webview: &WebView, _rules: Arc<Mutex<Rules>>) -> Result<(), String> {
+    Err("sub-resource filtering is only implemented for WebView2".into())
 }
 
 enum Phase {
@@ -388,6 +475,9 @@ fn main() {
                     }
                     match builder.build(&window) {
                         Ok(w) => {
+                            if let Err(e) = install_resource_filter(&w, rules.clone()) {
+                                eprintln!("jj1-view: no sub-resource filtering: {e}");
+                            }
                             webview = Some(w);
                             phase = Phase::Idle;
                         }
@@ -444,7 +534,10 @@ fn main() {
                 if matches!(phase, Phase::Dumping) {
                     let html: String = serde_json::from_str(&json).unwrap_or_default();
                     let url = webview.as_ref().and_then(|w| w.url().ok()).unwrap_or_default();
-                    let refused = rules.lock().map(|mut r| std::mem::take(&mut r.refused)).unwrap_or_default();
+                    let (refused, resources_blocked) = rules
+                        .lock()
+                        .map(|mut r| (std::mem::take(&mut r.refused), std::mem::take(&mut r.resources_blocked)))
+                        .unwrap_or_default();
                     let (elapsed, timed_out) = job
                         .as_ref()
                         .map(|j| (j.started.elapsed().as_millis() as u64, j.timed_out))
@@ -452,7 +545,7 @@ fn main() {
                     finish(
                         &mut phase,
                         &mut job,
-                        json!({"ok": true, "url": url, "html": html, "elapsed_ms": elapsed, "timed_out": timed_out, "blocked": refused}),
+                        json!({"ok": true, "url": url, "html": html, "elapsed_ms": elapsed, "timed_out": timed_out, "blocked": refused, "resources_blocked": resources_blocked}),
                     );
                 }
             }
@@ -481,6 +574,9 @@ fn main() {
                                     r.allow = strings(&cmd, "allow");
                                     r.deny = strings(&cmd, "deny");
                                     r.blocked = strings(&cmd, "blocked");
+                                    r.allow_private = cmd.get("allow_private").and_then(Value::as_bool).unwrap_or(false);
+                                    r.block_media = cmd.get("block_media").and_then(Value::as_bool).unwrap_or(true);
+                                    r.private_cache.clear();
                                     r.refused.clear();
                                     r.permits(&url)
                                 };

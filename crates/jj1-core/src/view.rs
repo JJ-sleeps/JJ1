@@ -31,6 +31,10 @@ pub struct NavRules {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub blocked: Vec<String>,
+    /// Permit localhost and private-network addresses.
+    pub allow_private: bool,
+    /// Do not load images, media or fonts; block blocklisted sub-resources.
+    pub block_media: bool,
 }
 
 pub trait Engine {
@@ -116,6 +120,7 @@ impl Engine for ViewWorker {
         self.request(json!({
             "op": "load", "url": url, "timeout_ms": timeout_ms,
             "allow": rules.allow, "deny": rules.deny, "blocked": rules.blocked,
+            "allow_private": rules.allow_private, "block_media": rules.block_media,
         }))
     }
 

@@ -113,6 +113,9 @@ pub struct Tab {
     live: Option<Box<dyn Engine>>,
     /// Why this tier was used, or what went wrong trying a heavier one.
     pub note: Option<String>,
+    last_used: std::cell::Cell<std::time::Instant>,
+    /// The live page was stopped after sitting idle; content is from before.
+    pub suspended: bool,
 }
 
 fn is_text_kind(kind: &str) -> bool {
@@ -172,6 +175,8 @@ impl Tab {
             checks: HashMap::new(),
             live: None,
             note: None,
+            last_used: std::cell::Cell::new(std::time::Instant::now()),
+            suspended: false,
         }
     }
 
@@ -429,6 +434,7 @@ impl Session {
             respect_robots: cfg.respect_robots,
             min_interval_ms: cfg.min_interval_ms,
             blocked_hosts: cfg.blocked_hosts.clone(),
+            allow_private_network: cfg.allow_private_network,
             ..NetConfig::default()
         };
         if !cfg.user_agent.trim().is_empty() {
@@ -450,7 +456,80 @@ impl Session {
     }
 
     pub fn tab(&self, id: u32) -> Res<&Tab> {
-        self.tabs.get(&id).ok_or_else(|| format!("No tab {id}. Open tabs: {}.", self.tab_ids()))
+        let tab = self.tabs.get(&id).ok_or_else(|| format!("No tab {id}. Open tabs: {}.", self.tab_ids()))?;
+        tab.last_used.set(std::time::Instant::now());
+        Ok(tab)
+    }
+
+    /// Stop the engines behind live tabs nobody has used for a while. The tab
+    /// keeps its last content and is reloaded on its next snapshot or action.
+    /// Returns how many were suspended.
+    pub fn reap_idle(&mut self) -> usize {
+        let limit = self.cfg.live_idle_secs;
+        if limit == 0 {
+            return 0;
+        }
+        let mut suspended = Vec::new();
+        for tab in self.tabs.values_mut() {
+            if tab.live.is_some() && tab.last_used.get().elapsed().as_secs() >= limit {
+                tab.live = None; // dropping the engine ends its process
+                tab.suspended = true;
+                suspended.push(tab.id);
+            }
+        }
+        for id in &suspended {
+            self.audit(&format!("suspend\ttab={id}\tidle {limit}s"));
+        }
+        suspended.len()
+    }
+
+    /// Reload a suspended tab in a fresh engine, keeping its element IDs.
+    fn resume(&mut self, tab_id: u32) -> Res<()> {
+        let url = self.tab(tab_id)?.url.clone();
+        let prev = self.tabs.remove(&tab_id);
+        match self.open_live(tab_id, &url, prev) {
+            Ok(tab) => {
+                self.tabs.insert(tab_id, tab);
+                Ok(())
+            }
+            Err(e) => Err(format!("Tab {tab_id} had been suspended and could not be reloaded ({e}) It was closed.")),
+        }
+    }
+
+    /// Search a tab for elements and text lines containing every word of
+    /// `query`. Much cheaper than reading a whole page to locate one thing.
+    pub fn find(&self, tab_id: u32, query: &str, limit: usize) -> Res<String> {
+        let tab = self.tab(tab_id)?;
+        let terms: Vec<String> = query.to_lowercase().split_whitespace().map(str::to_string).collect();
+        if terms.is_empty() {
+            return Err("Give at least one word to look for.".into());
+        }
+        let hit = |s: &str| {
+            let lower = s.to_lowercase();
+            terms.iter().all(|t| lower.contains(t.as_str()))
+        };
+        let limit = limit.max(1);
+        let elements: Vec<String> = tab.actions.iter().map(|a| tab.line(a)).filter(|l| hit(l)).collect();
+        let text = tab.whole_page_markdown();
+        let lines: Vec<&str> = text.lines().filter(|l| hit(l)).collect();
+
+        let mut inner = format!("elements matching \"{query}\": {}", elements.len());
+        for l in elements.iter().take(limit) {
+            inner.push('\n');
+            inner.push_str(l);
+        }
+        if elements.len() > limit {
+            inner.push_str(&format!("\n(+{} more)", elements.len() - limit));
+        }
+        inner.push_str(&format!("\n\ntext lines matching: {}", lines.len()));
+        for l in lines.iter().take(limit) {
+            inner.push_str("\n> ");
+            inner.push_str(&distill::dom::clip(l, 240));
+        }
+        if lines.len() > limit {
+            inner.push_str(&format!("\n(+{} more)", lines.len() - limit));
+        }
+        Ok(format!("{}\n{}", self.header(tab, est_tokens(&inner)), self.untrusted(&inner)))
     }
 
     /// `tab` if given, otherwise the most recently used tab.
@@ -516,13 +595,13 @@ impl Session {
         let id = self.next_tab;
 
         let tab = if tier == "full" {
-            self.open_live(id, &parsed)?
+            self.open_live(id, &parsed, None)?
         } else {
             let page = self.fetch(&parsed, Request::Get)?;
             let mut tab = Tab::build(id, page, None, "static");
             if tier == "auto" && self.cfg.js_escalation && tab.doc.needs_js && tab.status < 400 {
                 let target = tab.url.clone();
-                match self.open_live(id, &target) {
+                match self.open_live(id, &target, None) {
                     Ok(mut live) => {
                         let why = "escalated to the WebView tier: the static page was a JavaScript app shell.";
                         live.note = Some(match live.note.take() {
@@ -551,6 +630,8 @@ impl Session {
             allow: self.policy.allow.clone(),
             deny: self.policy.deny.clone(),
             blocked: self.net.blocked_hosts().to_vec(),
+            allow_private: self.cfg.allow_private_network,
+            block_media: self.cfg.webview_block_media,
         }
     }
 
@@ -561,7 +642,7 @@ impl Session {
     }
 
     /// Render `url` in a fresh WebView worker and build a live tab from it.
-    fn open_live(&mut self, id: u32, url: &Url) -> Res<Tab> {
+    fn open_live(&mut self, id: u32, url: &Url, prev: Option<Tab>) -> Res<Tab> {
         self.check_url(url)?;
         let timeout_ms = self.cfg.webview_timeout_secs * 1000;
         let mut engine: Box<dyn Engine> = Box::new(ViewWorker::spawn(&self.view_dir)?);
@@ -574,7 +655,7 @@ impl Session {
             self.check_url(&landed)?;
         }
         let timed_out = rendered.timed_out;
-        let mut tab = Tab::build(id, rendered_page(landed, rendered), None, "full");
+        let mut tab = Tab::build(id, rendered_page(landed, rendered), prev, "full");
         tab.live = Some(engine);
         if timed_out {
             tab.note = Some(format!(
@@ -642,7 +723,9 @@ impl Session {
         if tab.truncated {
             s.push_str("\nnote: the page was larger than max_body_kb and was cut off.");
         }
-        if let Some(note) = &tab.note {
+        if tab.suspended {
+            s.push_str("\nnote: this live tab was suspended after sitting idle, to free memory. What you see is from before; it reloads on the next jj1_snapshot or jj1_act.");
+        } else if let Some(note) = &tab.note {
             s.push_str(&format!("\nnote: {note}"));
         } else if tab.doc.needs_js && tab.tier == "static" {
             s.push_str("\nnote: this looks like a JavaScript app shell; the static tier is missing content. Open it with tier=\"full\" to run its scripts.");
@@ -690,9 +773,12 @@ impl Session {
         if !matches!(scope, "full" | "main" | "viewport") {
             return Err(format!("Unknown scope \"{scope}\". Use full, main or viewport."));
         }
+        if self.tabs.get(&tab_id).is_some_and(|t| t.suspended) {
+            self.resume(tab_id)?;
+        }
         // A live page may have changed on its own (timers, lazy loading), so a
         // snapshot re-reads it. Paging through one snapshot does not.
-        if offset == 0 {
+        else if offset == 0 {
             if let Some(engine) = self.tabs.get_mut(&tab_id).and_then(|t| t.live.as_mut()) {
                 let rendered = engine.dump()?;
                 self.install_rendered(tab_id, rendered)?;
@@ -745,6 +831,12 @@ impl Session {
     // ---- act ----
 
     pub fn act(&mut self, tab_id: u32, id: u32, action: &str, value: &str, confirm: bool) -> Res<String> {
+        if self.tabs.get(&tab_id).is_some_and(|t| t.suspended) {
+            self.resume(tab_id)?;
+            return Err(format!(
+                "Tab {tab_id} had been suspended after sitting idle (to free memory) and has just been reloaded. Anything typed into it earlier is gone, and nothing has been done yet. Take a jj1_snapshot and repeat the action."
+            ));
+        }
         let tab = self.tab(tab_id)?;
         let before = tab.lines();
         let index = tab

@@ -19,6 +19,15 @@ pub struct Config {
     pub min_interval_ms: u64,
     /// Extra blocked hosts on top of the built-in list.
     pub blocked_hosts: Vec<String>,
+    /// Allow localhost and private-network addresses. Off by default so a web
+    /// page cannot point the agent's browser at services inside your network.
+    pub allow_private_network: bool,
+    /// Stop the WebView behind a live tab after this many idle seconds to free
+    /// memory (0 = never). The tab is reloaded the next time it is used.
+    pub live_idle_secs: u64,
+    /// In the WebView tier, do not download images, media or fonts, and block
+    /// requests to blocklisted hosts.
+    pub webview_block_media: bool,
     /// Append every agent action to `audit.log` next to the config file.
     pub audit_log: bool,
     /// With tier="auto", retry in the system WebView when the static tier
@@ -55,6 +64,9 @@ impl Default for Config {
             respect_robots: true,
             min_interval_ms: 200,
             blocked_hosts: Vec::new(),
+            allow_private_network: false,
+            live_idle_secs: 120,
+            webview_block_media: true,
             audit_log: true,
             js_escalation: true,
             persistent_profile: false,

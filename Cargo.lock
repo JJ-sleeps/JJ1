@@ -1548,8 +1548,12 @@ dependencies = [
 name = "jj1-engine-view"
 version = "0.1.0"
 dependencies = [
+ "jj1-net",
  "serde_json",
  "tao",
+ "url",
+ "webview2-com",
+ "windows",
  "wry",
 ]
 

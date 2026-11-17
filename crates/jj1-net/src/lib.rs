@@ -33,6 +33,10 @@ pub struct NetConfig {
     pub min_interval_ms: u64,
     /// Extra blocked hosts, on top of the built-in list.
     pub blocked_hosts: Vec<String>,
+    /// Allow localhost, private (RFC 1918), link-local and similar addresses.
+    /// Off by default: a web page must not be able to steer the agent's
+    /// browser at services inside the user's own network.
+    pub allow_private_network: bool,
 }
 
 impl Default for NetConfig {
@@ -48,6 +52,7 @@ impl Default for NetConfig {
             respect_robots: true,
             min_interval_ms: 200,
             blocked_hosts: Vec::new(),
+            allow_private_network: false,
         }
     }
 }
@@ -56,6 +61,7 @@ impl Default for NetConfig {
 pub enum NetError {
     Scheme(String),
     BlockedHost(String),
+    PrivateNetwork(String),
     Policy(String),
     Robots(String),
     Unsupported { url: String, content_type: String },
@@ -67,6 +73,10 @@ impl fmt::Display for NetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NetError::Scheme(u) => write!(f, "Only http and https URLs can be opened (got {u})."),
+            NetError::PrivateNetwork(h) => write!(
+                f,
+                "{h} is a local or private-network address, which JJ1 does not open by default. Set allow_private_network = true in config.toml if you really want this."
+            ),
             NetError::BlockedHost(h) => write!(
                 f,
                 "Host {h} is on the JJ1 blocklist (ads/trackers). Edit blocked_hosts or rules/blocklist.txt to change this."
@@ -115,6 +125,61 @@ pub struct Net {
     blocked: Vec<String>,
     robots: HashMap<String, Robots>,
     last_hit: HashMap<String, Instant>,
+    /// host -> is it a private-network address (cached lookups).
+    private_cache: HashMap<String, bool>,
+}
+
+/// Loopback, private, link-local (including cloud metadata 169.254.169.254),
+/// carrier-grade NAT, unspecified, multicast and their IPv6 equivalents.
+pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10
+                || o[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
+/// Does this URL's host name or literal point into a private network?
+/// Names are resolved; a name that does not resolve is not treated as private
+/// (the request will fail on its own).
+pub fn points_to_private_network(url: &Url) -> bool {
+    use std::net::ToSocketAddrs;
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => is_private_ip(ip.into()),
+        Some(url::Host::Ipv6(ip)) => is_private_ip(ip.into()),
+        Some(url::Host::Domain(name)) => {
+            let name = name.to_ascii_lowercase();
+            if name == "localhost" || name.ends_with(".localhost") {
+                return true;
+            }
+            let port = url.port_or_known_default().unwrap_or(80);
+            match (name.as_str(), port).to_socket_addrs() {
+                Ok(addrs) => addrs.into_iter().any(|a| is_private_ip(a.ip())),
+                Err(_) => false,
+            }
+        }
+        None => false,
+    }
 }
 
 pub fn host_matches(host: &str, entry: &str) -> bool {
@@ -146,7 +211,7 @@ impl Net {
             .collect();
         blocked.extend(cfg.blocked_hosts.iter().map(|h| h.trim().to_ascii_lowercase()));
 
-        Ok(Net { cfg, client, blocked, robots: HashMap::new(), last_hit: HashMap::new() })
+        Ok(Net { cfg, client, blocked, robots: HashMap::new(), last_hit: HashMap::new(), private_cache: HashMap::new() })
     }
 
     pub fn config(&self) -> &NetConfig {
@@ -215,6 +280,19 @@ impl Net {
         let host = url.host_str().unwrap_or("").to_ascii_lowercase();
         if self.blocked.iter().any(|b| host_matches(&host, b)) {
             return Err(NetError::BlockedHost(host));
+        }
+        if !self.cfg.allow_private_network {
+            let private = match self.private_cache.get(&host) {
+                Some(p) => *p,
+                None => {
+                    let p = points_to_private_network(url);
+                    self.private_cache.insert(host.clone(), p);
+                    p
+                }
+            };
+            if private {
+                return Err(NetError::PrivateNetwork(host));
+            }
         }
         gate(url).map_err(NetError::Policy)?;
         if self.cfg.respect_robots {
@@ -370,6 +448,22 @@ mod tests {
         assert!(host_matches("doubleclick.net", "doubleclick.net"));
         assert!(host_matches("ads.doubleclick.net", "doubleclick.net"));
         assert!(!host_matches("notdoubleclick.net", "doubleclick.net"));
+    }
+
+    #[test]
+    fn private_addresses() {
+        let private = ["127.0.0.1", "10.1.2.3", "192.168.0.10", "172.16.5.5", "169.254.169.254", "100.64.0.1", "0.0.0.0", "::1", "fe80::1", "fd00::1", "::ffff:10.0.0.1"];
+        for ip in private {
+            assert!(is_private_ip(ip.parse().unwrap()), "{ip} should be private");
+        }
+        for ip in ["8.8.8.8", "93.184.216.34", "172.32.0.1", "2606:4700::1111"] {
+            assert!(!is_private_ip(ip.parse().unwrap()), "{ip} should be public");
+        }
+        let u = |s: &str| Url::parse(s).unwrap();
+        assert!(points_to_private_network(&u("http://localhost:8080/")));
+        assert!(points_to_private_network(&u("http://app.localhost/")));
+        assert!(points_to_private_network(&u("http://[::1]/")));
+        assert!(points_to_private_network(&u("http://192.168.1.1/admin")));
     }
 
     #[test]
