@@ -1,20 +1,17 @@
-//! jj1-browser: JJ1 for a person. A normal window with tabs, an address bar
-//! and navigation buttons, on the system WebView.
+//! jj1-browser: JJ1 for a person. A windowed browser on the system WebView,
+//! with tabs, an address bar, a local-model assistant (Deuri), an Agent view,
+//! favicons, user extensions, and a translucent "glass" look.
 //!
 //!   jj1-browser [url] [--agent-view] [--deuri-ask "question"]
 //!
-//! Two extras over an ordinary browser:
-//! - "Agent view" shows what JJ1 would hand to an AI agent for the current
-//!   page (distilled text, the numbered action map, injection-scan findings).
-//! - "Deuri" opens a chat panel backed by a local model in LM Studio. The
-//!   model is loaded only when a message is sent; Deuri can read the active
-//!   tab, look things up on it, search the web and open pages in it.
+//! - Ctrl+T new tab, Ctrl+W close tab, Ctrl+N new window, Ctrl+L address bar,
+//!   Ctrl+R reload, Ctrl+J Deuri.
+//! - "Agent view" shows what an AI agent would receive for the current page.
+//! - "Deuri" chats with a local model (LM Studio); it reads and steers the tab.
+//! - Extensions live in `%APPDATA%\jj1\extensions`; the puzzle button lists them.
+//!   The bundled "SS Screenshot" extension saves the tab when you press S twice.
 //!
-//! `--agent-view` opens the page and then its Agent view straight away.
-//! `--deuri-ask` opens the page, then the chat panel, and sends the question.
-//!
-//! The toolbar and the chat panel are small web pages in their own child
-//! WebViews; each tab is another child WebView.
+//! Each tab, the toolbar and the Deuri panel are separate child WebViews.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -24,8 +21,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
 use jj1_distill::{est_tokens, Options, Scope};
-use jj1_engine_view::{deuri, install_request_filter};
+use jj1_engine_view::{deuri, extensions, install_request_filter, screenshot};
 use jj1_net::{host_matches, points_to_private_network, DEFAULT_BLOCKLIST};
 use serde_json::{json, Value};
 use tao::dpi::LogicalSize;
@@ -36,43 +34,55 @@ use url::Url;
 use wry::dpi::{LogicalPosition, LogicalSize as WrySize};
 use wry::{NewWindowResponse, PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder};
 
-/// Height of the toolbar (tab strip + address row), in logical pixels.
 const BAR_HEIGHT: f64 = 80.0;
-/// Width of the Deuri panel on a wide window, in logical pixels.
 const PANEL_WIDTH: f64 = 400.0;
 const SEARCH_URL: &str = "https://duckduckgo.com/?q=";
-/// Deuri searches with the plain-HTML results page: it reads reliably
-/// without waiting for scripts.
 const DEURI_SEARCH_URL: &str = "https://html.duckduckgo.com/html/?q=";
 const AGENT_VIEW_URL: &str = "jj1://agent-view";
+const EXT_URL: &str = "jj1://extensions";
 const START_URL: &str = "jj1://start";
 const OUTER_HTML: &str = "document.documentElement.outerHTML";
-/// One part of a page handed to Deuri: about 5k tokens.
 const PART_CHARS: usize = 20_000;
-/// How long a Deuri tool may take (page load included).
 const TOOL_TIMEOUT: Duration = Duration::from_secs(45);
-/// Pause after a page Deuri opened reports "loaded", so scripts can fill it.
 const SETTLE: Duration = Duration::from_millis(1200);
 
+/// The beach photo on the start page, embedded so the browser needs no network.
+fn beach_data_url() -> String {
+    const BYTES: &[u8] = include_bytes!("../../assets/beach.jpg");
+    format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(BYTES))
+}
+
 const TOOLBAR_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8"><style>
-:root{color-scheme:light dark;--bg:#e6e9ee;--bar:#f8f9fb;--fg:#1d2126;--mut:#5f6876;--line:#d3d8e0;--acc:#2f6fed}
-@media(prefers-color-scheme:dark){:root{--bg:#191b1f;--bar:#272a30;--fg:#e8eaed;--mut:#9aa1ab;--line:#3b4048;--acc:#7aa7ff}}
+/* Always the light "frosted glass" chrome, whatever the system theme. */
+:root{color-scheme:light;
+  --chrome:rgba(250,251,253,.66);--fg:#222733;--mut:#5c6675;--line:rgba(120,130,150,.26);
+  --acc:#2f6fed;--field:rgba(255,255,255,.78);--active:rgba(255,255,255,.96);--hover:rgba(110,125,150,.14)}
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg);user-select:none}
-#tabs{display:flex;align-items:flex-end;height:36px;padding:4px 6px 0;gap:2px}
-.tab{display:flex;align-items:center;gap:4px;min-width:48px;max-width:230px;flex:1 1 170px;height:32px;padding:0 6px 0 12px;border-radius:8px 8px 0 0;color:var(--mut)}
-.tab.on{background:var(--bar);color:var(--fg)}
+html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,"Segoe UI",sans-serif;color:var(--fg);user-select:none;
+  background:var(--chrome);backdrop-filter:blur(34px) saturate(170%);-webkit-backdrop-filter:blur(34px) saturate(170%)}
+#tabs{display:flex;align-items:flex-end;height:38px;padding:6px 8px 0;gap:3px}
+.tab{display:flex;align-items:center;gap:7px;min-width:52px;max-width:230px;flex:1 1 172px;height:32px;
+  padding:0 7px 0 11px;border-radius:10px 10px 0 0;color:var(--mut);transition:background .12s}
+.tab:hover{background:var(--hover)}
+.tab.on{background:var(--active);color:var(--fg);box-shadow:0 2px 10px rgba(30,40,60,.10)}
+.tab .fav{width:15px;height:15px;flex:none;border-radius:3px;object-fit:contain}
+.tab .fav.blank{background:var(--mut);-webkit-mask:var(--globe) center/contain no-repeat;mask:var(--globe) center/contain no-repeat;opacity:.55}
 .tab span{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.tab.busy span::before{content:"\25CC  "}
-.x,#new{border:0;background:none;color:inherit;width:22px;height:22px;border-radius:50%;font-size:14px;line-height:1;cursor:pointer;flex:none}
-#new{margin:0 0 5px 4px;font-size:18px}
-.x:hover,#new:hover,.nav:hover:enabled,.pill:hover{background:rgba(127,127,127,.22)}
-#bar{display:flex;align-items:center;gap:4px;height:44px;padding:0 8px;background:var(--bar);border-bottom:1px solid var(--line)}
-.nav{border:0;background:none;color:var(--fg);width:32px;height:32px;border-radius:50%;font-size:17px;cursor:pointer}
+.tab.busy .fav{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.x,#new{border:0;background:none;color:inherit;width:22px;height:22px;border-radius:50%;font-size:14px;line-height:1;cursor:pointer;flex:none;opacity:.7}
+.x:hover,#new:hover{opacity:1;background:var(--hover)}
+#new{margin:0 2px 5px 5px;font-size:19px}
+#bar{display:flex;align-items:center;gap:5px;height:46px;padding:0 10px;border-top:1px solid var(--line)}
+.nav,.pill{border:0;background:none;color:var(--fg);cursor:pointer;font:inherit}
+.nav{width:34px;height:34px;border-radius:50%;font-size:17px}
 .nav:disabled{opacity:.3;cursor:default}
-#url{flex:1;height:32px;margin:0 4px;border:1px solid var(--line);border-radius:16px;padding:0 14px;font:inherit;background:var(--bg);color:var(--fg);outline:none;user-select:text}
-#url:focus{border-color:var(--acc)}
-.pill{border:1px solid var(--line);background:none;color:var(--fg);height:32px;border-radius:16px;padding:0 14px;font:inherit;cursor:pointer;white-space:nowrap}
+.nav:hover:enabled,.pill:hover,#icon:hover{background:var(--hover)}
+#url{flex:1;height:34px;margin:0 6px;border:1px solid var(--line);border-radius:18px;padding:0 16px;font:inherit;
+  background:var(--field);color:var(--fg);outline:none;user-select:text;box-shadow:inset 0 1px 2px rgba(0,0,0,.04)}
+#url:focus{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
+#icon{width:34px;height:34px;border:0;background:none;color:var(--fg);border-radius:50%;cursor:pointer;font-size:16px}
+.pill{height:34px;border:1px solid var(--line);border-radius:18px;padding:0 15px;white-space:nowrap}
 #deuri.on,#deuri.on:hover{background:var(--acc);border-color:var(--acc);color:#fff}
 </style></head><body>
 <div id="tabs"></div>
@@ -81,21 +91,28 @@ html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,"Segoe UI",sa
   <button class="nav" id="fwd" title="Forward (Alt+Right)">&#8594;</button>
   <button class="nav" id="reload" title="Reload (Ctrl+R)">&#8635;</button>
   <input id="url" spellcheck="false" autocomplete="off" placeholder="Search or enter address">
+  <button id="icon" title="New window (Ctrl+N)">&#9638;</button>
+  <button id="icon" title="Extensions" onclick="send({c:'extensions'})">&#129513;</button>
   <button class="pill" id="deuri" title="Chat with Deuri, the local assistant (Ctrl+J)">Deuri</button>
-  <button class="pill" id="agent" title="Show what an AI agent receives for this page">Agent view</button>
+  <button class="pill" id="agent" title="What an AI agent receives for this page">Agent view</button>
 </div>
 <script>
+var GLOBE="url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22black%22><path d=%22M12 2a10 10 0 100 20 10 10 0 000-20zm6.9 6h-2.5a15 15 0 00-1.1-3.3A8 8 0 0118.9 8zM12 4c.8 0 1.9 1.6 2.4 4H9.6C10.1 5.6 11.2 4 12 4zM4.3 14a8 8 0 010-4h2.9a16 16 0 000 4zm.8 2h2.5a15 15 0 001.1 3.3A8 8 0 015.1 16zM9.6 16h4.8C13.9 18.4 12.8 20 12 20s-1.9-1.6-2.4-4zm.9-2a14 14 0 010-4h3a14 14 0 010 4zm5.3 5.3a15 15 0 001.1-3.3h2.5a8 8 0 01-3.6 3.3zM16.8 14a16 16 0 000-4h2.9a8 8 0 010 4z%22/></svg>')";
+document.documentElement.style.setProperty('--globe', GLOBE);
 function send(o){ window.ipc.postMessage(JSON.stringify(o)); }
 var url = document.getElementById('url'), shown = '';
 window.setState = function(s){
   var strip = document.getElementById('tabs'); strip.textContent = '';
   s.tabs.forEach(function(t){
     var d = document.createElement('div'); d.className = 'tab' + (t.active ? ' on' : '') + (t.loading ? ' busy' : '');
+    var ic = document.createElement('img'); ic.className = 'fav';
+    if (t.favicon) { ic.src = t.favicon; ic.onerror = function(){ ic.classList.add('blank'); ic.removeAttribute('src'); }; }
+    else { ic.classList.add('blank'); }
     var label = document.createElement('span'); label.textContent = t.title || 'New tab'; d.title = t.title || '';
     var x = document.createElement('button'); x.className = 'x'; x.textContent = '\u00D7'; x.title = 'Close tab (Ctrl+W)';
-    x.onclick = function(e){ e.stopPropagation(); send({c:'close', id:t.id}); };
+    x.onmousedown = function(e){ if (e.button === 0) { e.preventDefault(); e.stopPropagation(); send({c:'close', id:t.id}); } };
     d.onmousedown = function(e){ if (e.button === 1) send({c:'close', id:t.id}); else if (e.button === 0) send({c:'switch', id:t.id}); };
-    d.appendChild(label); d.appendChild(x); strip.appendChild(d);
+    d.appendChild(ic); d.appendChild(label); d.appendChild(x); strip.appendChild(d);
   });
   var plus = document.createElement('button'); plus.id = 'new'; plus.textContent = '+'; plus.title = 'New tab (Ctrl+T)';
   plus.onclick = function(){ send({c:'new'}); }; strip.appendChild(plus);
@@ -116,10 +133,12 @@ document.getElementById('fwd').onclick = function(){ send({c:'fwd'}); };
 document.getElementById('reload').onclick = function(){ send({c:'reload'}); };
 document.getElementById('deuri').onclick = function(){ send({c:'deuri'}); };
 document.getElementById('agent').onclick = function(){ send({c:'agent'}); };
+document.querySelectorAll('#icon')[0].onclick = function(){ send({c:'newwindow'}); };
 window.addEventListener('keydown', function(e){
   if ((e.ctrlKey || e.metaKey) && !e.altKey) {
     var k = e.key.toLowerCase();
     if (k === 't') { e.preventDefault(); send({c:'new'}); }
+    else if (k === 'n') { e.preventDefault(); send({c:'newwindow'}); }
     else if (k === 'w') { e.preventDefault(); send({c:'closeactive'}); }
     else if (k === 'l') { e.preventDefault(); window.focusUrl(); }
     else if (k === 'r') { e.preventDefault(); send({c:'reload'}); }
@@ -130,68 +149,69 @@ window.addEventListener('contextmenu', function(e){ if (e.target !== url) e.prev
 send({c:'ready'});
 </script></body></html>"##;
 
-/// Runs in every page: forwards the browser's own shortcuts, which would
-/// otherwise be swallowed by the page that has keyboard focus.
-const SHORTCUTS_JS: &str = r#"window.addEventListener('keydown', function(e){
-  if (!window.ipc) return;
-  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
-    var k = e.key.toLowerCase();
-    if (k === 't' || k === 'w' || k === 'l' || k === 'j') { e.preventDefault(); window.ipc.postMessage('key:' + k); }
+/// Injected into every web page at document start: browser shortcuts, a
+/// favicon reporter, and any enabled extensions (appended at runtime).
+const PAGE_BOOTSTRAP: &str = r#"(function(){
+  if (window.__jj1boot) return; window.__jj1boot = 1;
+  function ipc(m){ try{ if(window.ipc) window.ipc.postMessage(m); }catch(e){} }
+  window.addEventListener('keydown', function(e){
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+      var k = e.key.toLowerCase();
+      if (k==='t'||k==='w'||k==='l'||k==='n'||k==='r'||k==='j') { e.preventDefault(); ipc('key:'+k); }
+    }
+  }, true);
+  function favicon(){
+    try {
+      var ls = document.querySelectorAll('link[rel~="icon"],link[rel="shortcut icon"]');
+      var href = ''; for (var i=0;i<ls.length;i++){ if (ls[i].href) href = ls[i].href; }
+      if (!href) href = location.origin + '/favicon.ico';
+      fetch(href).then(function(r){ if(!r.ok) throw 0; return r.blob(); }).then(function(b){
+        if (b.size > 120000) { ipc('favicon:'); return; }
+        var fr = new FileReader(); fr.onload = function(){ ipc('favicon:'+fr.result); }; fr.readAsDataURL(b);
+      }).catch(function(){ ipc('favicon:'); });
+    } catch(e){ ipc('favicon:'); }
   }
-}, true);"#;
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', favicon); else favicon();
+})();
+"#;
 
-const START_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8"><title>New tab</title><style>
-:root{color-scheme:light dark}
-body{margin:0;min-height:100vh;display:grid;place-items:center;font:15px system-ui,"Segoe UI",sans-serif;background:Canvas;color:CanvasText}
-main{max-width:34em;padding:2em;text-align:center}
-h1{font-size:2.6em;margin:0 0 .2em;letter-spacing:.02em}
-p{opacity:.75;line-height:1.55}
-kbd{border:1px solid;border-radius:4px;padding:0 5px;font:inherit;opacity:.8}
-</style></head><body><main>
-<h1>JJ1</h1>
-<p>Type an address or a search in the bar above.</p>
-<p><kbd>Ctrl</kbd>+<kbd>L</kbd> address bar &nbsp; <kbd>Ctrl</kbd>+<kbd>T</kbd> new tab &nbsp; <kbd>Ctrl</kbd>+<kbd>W</kbd> close tab &nbsp; <kbd>Ctrl</kbd>+<kbd>J</kbd> Deuri</p>
-<p><b>Deuri</b> is an assistant that runs on this computer and can read the page you are on.<br><b>Agent view</b> shows what an AI agent would receive for a page.</p>
-</main></body></html>"##;
-
-/// The Deuri chat panel. Model output is escaped before any formatting is
-/// applied, and links open in a new tab instead of inside the panel.
 const DEURI_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8"><style>
-:root{color-scheme:light dark;--bg:#f8f9fb;--fg:#1d2126;--mut:#5f6876;--line:#d3d8e0;--acc:#2f6fed;--me:#2f6fed;--bot:#eceff3;--code:#e1e5eb}
-@media(prefers-color-scheme:dark){:root{--bg:#202226;--fg:#e8eaed;--mut:#9aa1ab;--line:#3b4048;--acc:#7aa7ff;--me:#3a63c9;--bot:#2c2f35;--code:#17191c}}
+:root{color-scheme:light;--bg:rgba(250,251,253,.64);--fg:#222733;--mut:#5c6675;--line:rgba(120,130,150,.26);
+  --acc:#2f6fed;--me:#2f6fed;--bot:rgba(255,255,255,.78);--code:rgba(110,125,150,.14)}
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;font:14px/1.5 system-ui,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg)}
-body{display:flex;flex-direction:column;border-left:1px solid var(--line)}
-header{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line)}
+html,body{margin:0;height:100%;font:14px/1.5 system-ui,"Segoe UI",sans-serif;color:var(--fg)}
+body{display:flex;flex-direction:column;background:var(--bg);
+  backdrop-filter:blur(36px) saturate(170%);-webkit-backdrop-filter:blur(36px) saturate(170%);border-left:1px solid var(--line)}
+header{display:flex;align-items:center;gap:8px;padding:11px 13px;border-bottom:1px solid var(--line)}
 header b{font-size:15px}
 #model{flex:1;min-width:0;color:var(--mut);font-size:12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-header button{border:1px solid var(--line);background:none;color:var(--fg);border-radius:14px;padding:3px 10px;font:inherit;font-size:12px;cursor:pointer}
-header button:hover{background:rgba(127,127,127,.18)}
-#log{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
-.msg{max-width:94%;padding:8px 12px;border-radius:12px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}
-.me{align-self:flex-end;background:var(--me);color:#fff;border-bottom-right-radius:4px}
-.bot{align-self:flex-start;background:var(--bot);border-bottom-left-radius:4px}
+header button{border:1px solid var(--line);background:none;color:var(--fg);border-radius:14px;padding:3px 11px;font:inherit;font-size:12px;cursor:pointer}
+header button:hover{background:rgba(127,127,127,.16)}
+#log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:11px}
+.msg{max-width:94%;padding:9px 13px;border-radius:14px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}
+.me{align-self:flex-end;background:var(--me);color:#fff;border-bottom-right-radius:5px;box-shadow:0 2px 12px color-mix(in srgb,var(--me) 40%,transparent)}
+.bot{align-self:flex-start;background:var(--bot);border-bottom-left-radius:5px;box-shadow:0 2px 12px rgba(30,40,60,.08)}
 .err{border:1px solid #d9534f}
 .step{align-self:flex-start;color:var(--mut);font-size:12px;padding:0 4px}
-.bot pre{background:var(--code);padding:8px;border-radius:6px;overflow-x:auto;white-space:pre;margin:6px 0}
+.bot pre{background:var(--code);padding:9px;border-radius:8px;overflow-x:auto;white-space:pre;margin:6px 0}
 .bot code{background:var(--code);padding:0 4px;border-radius:4px;font:12.5px ui-monospace,Consolas,monospace}
 .bot pre code{background:none;padding:0}
 .bot a{color:var(--acc);cursor:pointer;text-decoration:underline}
 #empty{color:var(--mut);text-align:center;margin:auto;padding:20px;max-width:26em}
-#status{min-height:20px;padding:0 14px;color:var(--mut);font-size:12px}
-footer{padding:6px 12px 12px;border-top:1px solid var(--line)}
+#status{min-height:20px;padding:0 15px;color:var(--mut);font-size:12px}
+footer{padding:8px 13px 13px;border-top:1px solid var(--line)}
 #row{display:flex;gap:8px;align-items:flex-end}
-textarea{flex:1;resize:none;height:40px;min-height:40px;max-height:160px;padding:9px 12px;border:1px solid var(--line);border-radius:12px;font:inherit;background:var(--bg);color:var(--fg);outline:none}
+textarea{flex:1;resize:none;height:42px;min-height:42px;max-height:160px;padding:10px 13px;border:1px solid var(--line);border-radius:14px;font:inherit;background:var(--bot);color:var(--fg);outline:none}
 textarea:focus{border-color:var(--acc)}
-#send{height:40px;padding:0 16px;border:0;border-radius:12px;background:var(--acc);color:#fff;font:inherit;cursor:pointer}
+#send{height:42px;padding:0 17px;border:0;border-radius:14px;background:var(--acc);color:#fff;font:inherit;cursor:pointer}
 #send.stop{background:#c0453a}
 #use{margin-top:6px;color:var(--mut);font-size:11px;display:flex;justify-content:space-between;gap:8px}
 </style></head><body>
-<header><b>Deuri</b><span id="model">local model</span><button id="new" title="Forget this conversation and start a new one">New chat</button></header>
-<div id="log"><div id="empty">Ask about the page you are on, or ask Deuri to look something up.<br><br>The model runs on this computer. It is loaded when you send your first message and unloads itself after a while idle.</div></div>
+<header><b>Deuri</b><span id="model">local model</span><button id="new" title="Start a new conversation">New chat</button></header>
+<div id="log"><div id="empty">Ask about the page you are on, or ask Deuri to look something up.<br><br>The model runs on this computer. It loads when you send your first message and unloads itself after a while idle.</div></div>
 <div id="status"></div>
 <footer><div id="row"><textarea id="box" placeholder="Message Deuri"></textarea><button id="send">Send</button></div>
-<div id="use"><span id="ctx"></span><span>Enter to send, Shift+Enter for a new line</span></div></footer>
+<div id="use"><span id="ctx"></span><span>Enter to send &middot; Shift+Enter new line</span></div></footer>
 <script>
 var log=document.getElementById('log'),box=document.getElementById('box'),btn=document.getElementById('send'),st=document.getElementById('status'),ctx=document.getElementById('ctx');
 var EMPTY=document.getElementById('empty').outerHTML;
@@ -216,7 +236,7 @@ function render(md){
 function near(){return log.scrollHeight-log.scrollTop-log.clientHeight<150;}
 function add(cls,html){var e=document.getElementById('empty');if(e)e.remove();var d=document.createElement('div');d.className=cls;d.innerHTML=html;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
 function setBusy(b){busy=b;btn.textContent=b?'Stop':'Send';btn.classList.toggle('stop',b);}
-function grow(){box.style.height='40px';box.style.height=Math.min(Math.max(box.scrollHeight,40),160)+'px';}
+function grow(){box.style.height='42px';box.style.height=Math.min(Math.max(box.scrollHeight,42),160)+'px';}
 function k(n){return n>=1000?(n/1000).toFixed(1)+'k':String(n);}
 function submit(){
   if(busy){post({c:'stop'});st.textContent='Stopping...';return;}
@@ -244,29 +264,65 @@ window.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&!e.altK
 post({c:'ready'});
 </script></body></html>"##;
 
+/// The beach start page. `$BG$` is replaced with the embedded image.
+const START_TEMPLATE: &str = r##"<!doctype html><html><head><meta charset="utf-8"><title>New tab</title><style>
+:root{color-scheme:light dark}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font-family:system-ui,"Segoe UI",sans-serif;color:#fff}
+body{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  background:#2b5c7a url('$BG$') center/cover no-repeat;position:relative}
+body::before{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(10,20,30,.28),rgba(10,20,30,.12) 40%,rgba(10,20,30,.42))}
+main{position:relative;z-index:1;width:100%;max-width:680px;padding:28px;text-align:center}
+h1{margin:0;font-size:clamp(34px,6vw,58px);font-weight:700;letter-spacing:.01em;text-shadow:0 3px 24px rgba(0,0,0,.35)}
+p.sub{margin:8px 0 34px;font-size:clamp(16px,2.4vw,22px);font-weight:300;opacity:.95;text-shadow:0 2px 14px rgba(0,0,0,.4)}
+form{display:flex;align-items:center;gap:10px;width:100%;max-width:560px;margin:0 auto;
+  background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.4);border-radius:30px;padding:8px 10px 8px 20px;
+  backdrop-filter:blur(18px) saturate(160%);-webkit-backdrop-filter:blur(18px) saturate(160%);box-shadow:0 18px 50px rgba(0,0,0,.28)}
+form svg{flex:none;opacity:.9}
+input{flex:1;height:40px;border:0;background:none;outline:none;color:#fff;font-size:17px}
+input::placeholder{color:rgba(255,255,255,.8)}
+button{flex:none;height:40px;padding:0 22px;border:0;border-radius:22px;background:#fff;color:#1b3b52;font:600 15px system-ui;cursor:pointer}
+button:hover{background:#eef4f8}
+.hint{margin-top:26px;font-size:13px;opacity:.9;text-shadow:0 1px 8px rgba(0,0,0,.4)}
+.hint b{font-weight:600}
+.credit{position:absolute;right:12px;bottom:10px;z-index:1;font-size:11px;opacity:.55}
+</style></head><body><main>
+<h1>Welcome to Deuri's world</h1>
+<p class="sub">start your heart out</p>
+<form id="f" autocomplete="off">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+  <input id="q" placeholder="Search the web or type an address" autofocus>
+  <button type="submit">Go</button>
+</form>
+<p class="hint"><b>Ctrl&nbsp;J</b> chat with Deuri &nbsp;&middot;&nbsp; <b>Ctrl&nbsp;T</b> new tab &nbsp;&middot;&nbsp; <b>Ctrl&nbsp;N</b> new window</p>
+</main>
+<div class="credit">Photo: Sean O. / Unsplash</div>
+<script>
+var q=document.getElementById('q');
+document.getElementById('f').addEventListener('submit',function(e){
+  e.preventDefault(); var v=q.value.trim(); if(v&&window.ipc) window.ipc.postMessage('nav:'+v);
+});
+setTimeout(function(){ q.focus(); }, 60);
+</script></body></html>"##;
+
 enum Msg {
-    /// Command from the toolbar page (JSON).
     Ui(String),
-    /// Shortcut forwarded from a page.
     Key(String),
     Load { tab: usize, finished: bool, url: String },
     Title { tab: usize, title: String },
-    /// A page asked for a new window: open it as a tab.
+    Favicon { tab: usize, data: String },
+    Navigate { tab: usize, input: String },
+    Ext { body: String },
     Popup(String),
     AgentHtml { tab: usize, json: String },
-    /// Command from the Deuri chat panel (JSON).
     Panel(String),
-    /// Progress of a Deuri turn, for the panel.
     Deuri(deuri::Event),
-    /// Deuri wants a tool run in the active tab; the result goes to `reply`.
     Tool { name: String, args: Value, reply: mpsc::Sender<String> },
-    /// A page Deuri opened has had a moment to settle after loading.
     Settled(usize),
 }
 
 enum Start {
     Url(String),
-    /// A built-in page, shown under `label` in the address bar.
     Html { html: String, label: &'static str },
 }
 
@@ -276,8 +332,8 @@ struct Tab {
     title: String,
     url: String,
     loading: bool,
-    /// Address-bar text for built-in pages (start page, agent view).
     label: Option<&'static str>,
+    favicon: Option<String>,
 }
 
 impl Tab {
@@ -290,7 +346,6 @@ impl Tab {
     }
 }
 
-/// `%APPDATA%\jj1` (or `JJ1_CONFIG_DIR`), same place the agent side uses.
 fn config_dir() -> PathBuf {
     std::env::var_os("JJ1_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| {
         let root = std::env::var_os("APPDATA")
@@ -310,8 +365,6 @@ fn search_url(base: &str, query: &str) -> String {
     format!("{base}{q}")
 }
 
-/// What the user typed -> where to go: a URL as is, a bare host with https,
-/// anything else as a search.
 fn resolve_input(text: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() {
@@ -352,8 +405,6 @@ fn parse_page_url(page_url: &str) -> Url {
     Url::parse(page_url).unwrap_or_else(|_| Url::parse("about:blank").expect("static URL"))
 }
 
-/// The active page for Deuri: title, one part of the readable text, and on
-/// the first part the page's links. Wrapped as untrusted content.
 fn page_for_deuri(page_url: &str, html: &str, part: usize, nonce: &str) -> String {
     let d = jj1_distill::distill(html, &parse_page_url(page_url), Options::default());
     let chars: Vec<char> = d.markdown.chars().collect();
@@ -388,7 +439,6 @@ fn page_for_deuri(page_url: &str, html: &str, part: usize, nonce: &str) -> Strin
     out
 }
 
-/// Lines and links on the page containing every word of `query`.
 fn find_for_deuri(page_url: &str, html: &str, query: &str, nonce: &str) -> String {
     let terms: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
     if terms.is_empty() {
@@ -419,9 +469,6 @@ fn find_for_deuri(page_url: &str, html: &str, query: &str, nonce: &str) -> Strin
     untrusted(nonce, &inner)
 }
 
-/// Where Deuri may navigate: http(s) only, nothing on the blocklist, nothing
-/// inside the user's own network (a page could otherwise talk the model into
-/// opening the router's admin page).
 fn check_url_for_deuri(raw: &str, blocked: &[String]) -> Result<String, String> {
     let url = Url::parse(raw).map_err(|_| format!("\"{raw}\" is not a web address."))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -439,7 +486,6 @@ fn check_url_for_deuri(raw: &str, blocked: &[String]) -> Result<String, String> 
     Ok(url.to_string())
 }
 
-/// The page behind the "Agent view" button.
 fn agent_view_page(page_url: &str, html: &str) -> String {
     let d = jj1_distill::distill(html, &parse_page_url(page_url), Options::default());
     let raw = est_tokens(html);
@@ -469,21 +515,10 @@ fn agent_view_page(page_url: &str, html: &str) -> String {
     } else {
         format!("<ul class=flag>{findings}</ul>")
     };
-    format!(
-        r##"<!doctype html><html><head><meta charset="utf-8"><title>Agent view: {title}</title><style>
-:root{{color-scheme:light dark}}
-body{{margin:0;font:14px/1.5 system-ui,"Segoe UI",sans-serif;background:Canvas;color:CanvasText}}
-main{{max-width:60em;margin:0 auto;padding:24px 20px 60px}}
-h1{{font-size:1.4em;margin:0 0 4px}} h2{{font-size:1.05em;margin:28px 0 8px}}
-.m{{opacity:.7}} .u{{word-break:break-all}}
-.stats{{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0}}
-.stats div{{border:1px solid color-mix(in srgb,CanvasText 22%,transparent);border-radius:8px;padding:8px 14px}}
-.stats b{{display:block;font-size:1.35em}}
-pre{{white-space:pre-wrap;word-break:break-word;border:1px solid color-mix(in srgb,CanvasText 22%,transparent);border-radius:8px;padding:14px;margin:0;font:13px/1.5 ui-monospace,Consolas,monospace}}
-.flag li{{margin:4px 0}}
-</style></head><body><main>
-<h1>Agent view</h1>
-<div class="m u">{url}</div>
+    chrome_page(
+        &format!("Agent view: {}", d.title),
+        &format!(
+            r#"<h1>Agent view</h1><div class="m u">{url}</div>
 <div class="stats">
   <div><b>~{raw}</b>tokens in the page's HTML</div>
   <div><b>~{sent}</b>tokens JJ1 would send</div>
@@ -492,24 +527,76 @@ pre{{white-space:pre-wrap;word-break:break-word;border:1px solid color-mix(in sr
   <div><b>{nflag}</b>flagged by the injection scan</div>
 </div>
 <p class="m">This is the page as an AI agent using JJ1 would receive it: readable text, then a numbered list of things it can act on. Text a person cannot see is removed and listed under "Flagged".</p>
-<h2>Text</h2><pre>{md}</pre>
-<h2>Action map</h2><pre>{actions}</pre>
-<h2>Flagged</h2>{findings}
-</main></body></html>"##,
-        title = esc(&d.title),
-        url = esc(page_url),
-        raw = raw,
-        sent = sent,
-        ratio = ratio,
-        nact = d.actions.len(),
-        nflag = d.findings.len(),
-        md = esc(&d.markdown),
-        actions = if actions.is_empty() { "(none)".to_string() } else { actions },
-        findings = findings,
+<h2>Text</h2><pre>{md}</pre><h2>Action map</h2><pre>{actions}</pre><h2>Flagged</h2>{findings}"#,
+            url = esc(page_url),
+            nact = d.actions.len(),
+            nflag = d.findings.len(),
+            md = esc(&d.markdown),
+            actions = if actions.is_empty() { "(none)".to_string() } else { actions },
+        ),
     )
 }
 
-// ------------------------------------------------------------- layout --
+fn extensions_page(exts: &[extensions::Extension], dir: &std::path::Path) -> String {
+    let mut cards = String::new();
+    for e in exts {
+        let badge = if e.enabled { "<span class=on>enabled</span>" } else { "<span class=off>disabled</span>" };
+        cards.push_str(&format!(
+            "<div class=ext><div class=exth><b>{}</b> <span class=v>v{}</span> {badge}</div><p>{}</p><code>{}</code></div>",
+            esc(&e.name),
+            esc(&e.version),
+            esc(if e.description.is_empty() { "(no description)" } else { &e.description }),
+            esc(&e.id)
+        ));
+    }
+    if cards.is_empty() {
+        cards = "<p class=m>No extensions yet.</p>".into();
+    }
+    chrome_page(
+        "Extensions",
+        &format!(
+            r#"<h1>Extensions</h1>
+<p class="m">Extensions are small bits of JavaScript that run on the pages you visit. They live in a folder on your computer \u2014 drop a new one in and reload the browser.</p>
+<div class="stats"><div><b>{n}</b>installed</div></div>
+{cards}
+<h2>Add your own</h2>
+<p>Make a folder in:</p><pre>{dir}</pre>
+<p>with two files:</p>
+<pre>manifest.json   {{ "name": "...", "description": "...", "version": "1.0", "enabled": true }}
+content.js      // runs on every page; can call the jj1 API below</pre>
+<h2>The jj1 API</h2>
+<pre>jj1.captureTab()     save a PNG of the current tab to Pictures\JJ1
+jj1.notify(text)     show a short toast on the page
+jj1.log(text)        write to the page console</pre>
+<p class="m">The bundled <b>SS Screenshot</b> extension is a worked example: press <b>S</b> twice quickly on any page and it screenshots the tab. Reload the browser (or open a new window) after changing an extension.</p>"#,
+            n = exts.len(),
+            dir = esc(&dir.display().to_string()),
+        ),
+    )
+}
+
+/// Shared shell for the built-in chrome pages (Agent view, Extensions).
+fn chrome_page(title: &str, body: &str) -> String {
+    format!(
+        r##"<!doctype html><html><head><meta charset="utf-8"><title>{title}</title><style>
+:root{{color-scheme:light dark}}
+body{{margin:0;font:14px/1.6 system-ui,"Segoe UI",sans-serif;background:Canvas;color:CanvasText}}
+main{{max-width:60em;margin:0 auto;padding:30px 22px 70px}}
+h1{{font-size:1.5em;margin:0 0 6px}} h2{{font-size:1.08em;margin:30px 0 8px}}
+.m{{opacity:.7}} .u{{word-break:break-all}}
+.stats{{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}}
+.stats div{{border:1px solid color-mix(in srgb,CanvasText 22%,transparent);border-radius:10px;padding:9px 15px}}
+.stats b{{display:block;font-size:1.4em}}
+pre{{white-space:pre-wrap;word-break:break-word;background:color-mix(in srgb,CanvasText 7%,transparent);border-radius:10px;padding:14px;margin:6px 0;font:13px/1.5 ui-monospace,Consolas,monospace}}
+.ext{{border:1px solid color-mix(in srgb,CanvasText 18%,transparent);border-radius:12px;padding:12px 16px;margin:10px 0}}
+.exth{{display:flex;align-items:center;gap:8px}} .v{{opacity:.6;font-size:.85em}}
+.on{{color:#2e9e5b;font-size:.8em;border:1px solid currentColor;border-radius:10px;padding:0 8px}}
+.off{{color:#b06;font-size:.8em;border:1px solid currentColor;border-radius:10px;padding:0 8px;opacity:.7}}
+.ext p{{margin:6px 0}} .ext code{{opacity:.6;font-size:.85em}}
+.flag li{{margin:4px 0}}
+</style></head><body><main>{body}</main></body></html>"##
+    )
+}
 
 fn logical_size(window: &Window) -> (f64, f64) {
     let s = window.inner_size().to_logical::<f64>(window.scale_factor());
@@ -555,21 +642,46 @@ fn relayout(window: &Window, toolbar: &WebView, tabs: &[Tab], panel: Option<&Web
     }
 }
 
-// --------------------------------------------------------- web views --
+#[cfg(windows)]
+fn window_hwnd(window: &Window) -> isize {
+    use tao::platform::windows::WindowExtWindows;
+    window.hwnd() as isize
+}
+
+/// Draw the window's title bar in light mode to match the frosted chrome,
+/// regardless of the system's dark/light setting.
+#[cfg(windows)]
+fn light_title_bar(window: &Window) {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    let hwnd = HWND(window_hwnd(window) as *mut core::ffi::c_void);
+    let dark = BOOL(0);
+    // SAFETY: valid HWND; the attribute is a single BOOL of the given size.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        );
+    }
+}
 
 fn open_tab(
     window: &Window,
     context: &mut WebContext,
     proxy: &EventLoopProxy<Msg>,
     blocked: &[String],
+    page_init: &str,
     id: usize,
     start: Start,
     bounds: Rect,
 ) -> Result<Tab, String> {
-    let (load_proxy, title_proxy, popup_proxy, key_proxy) = (proxy.clone(), proxy.clone(), proxy.clone(), proxy.clone());
+    let (load_proxy, title_proxy, popup_proxy, ipc_proxy) = (proxy.clone(), proxy.clone(), proxy.clone(), proxy.clone());
     let mut builder = WebViewBuilder::new_with_web_context(context)
         .with_bounds(bounds)
-        .with_initialization_script(SHORTCUTS_JS)
+        .with_initialization_script(page_init)
         .with_on_page_load_handler(move |event, url| {
             let _ = load_proxy.send_event(Msg::Load { tab: id, finished: matches!(event, PageLoadEvent::Finished), url });
         })
@@ -580,10 +692,16 @@ fn open_tab(
             let _ = popup_proxy.send_event(Msg::Popup(url));
             NewWindowResponse::Deny
         })
-        // Pages can only ask for the browser's own shortcuts, nothing else.
         .with_ipc_handler(move |req| {
-            if let Some(key) = req.body().strip_prefix("key:") {
-                let _ = key_proxy.send_event(Msg::Key(key.to_string()));
+            let body = req.body();
+            if let Some(k) = body.strip_prefix("key:") {
+                let _ = ipc_proxy.send_event(Msg::Key(k.to_string()));
+            } else if let Some(f) = body.strip_prefix("favicon:") {
+                let _ = ipc_proxy.send_event(Msg::Favicon { tab: id, data: f.to_string() });
+            } else if let Some(n) = body.strip_prefix("nav:") {
+                let _ = ipc_proxy.send_event(Msg::Navigate { tab: id, input: n.to_string() });
+            } else if body.starts_with("ext:") {
+                let _ = ipc_proxy.send_event(Msg::Ext { body: body.clone() });
             }
         });
     let (url, label) = match start {
@@ -598,7 +716,6 @@ fn open_tab(
     };
     let view = builder.build_as_child(window).map_err(|e| e.to_string())?;
 
-    // Same tracker/ad list the agent side uses. Images and fonts load normally.
     let blocked = blocked.to_vec();
     if let Err(e) = install_request_filter(&view, move |_kind, url| {
         Url::parse(url)
@@ -608,13 +725,14 @@ fn open_tab(
     }) {
         eprintln!("jj1-browser: tracker blocking is off: {e}");
     }
-    Ok(Tab { id, view, title: String::new(), url, loading: label.is_none(), label })
+    Ok(Tab { id, view, title: String::new(), url, loading: label.is_none(), label, favicon: None })
 }
 
 fn create_panel(window: &Window, context: &mut WebContext, proxy: &EventLoopProxy<Msg>) -> Result<WebView, String> {
     let p = proxy.clone();
     WebViewBuilder::new_with_web_context(context)
         .with_bounds(panel_bounds(window))
+        .with_transparent(true)
         .with_html(DEURI_HTML)
         .with_new_window_req_handler(|_url, _features| NewWindowResponse::Deny)
         .with_ipc_handler(move |req| {
@@ -636,8 +754,6 @@ fn event_js(e: &deuri::Event) -> String {
     format!("window.deuriEvent&&window.deuriEvent({v})")
 }
 
-/// Run one Deuri message on its own thread. Tools are executed by the event
-/// loop (web views live on the UI thread); this thread waits for their result.
 fn start_turn(
     settings: deuri::Settings,
     history: Arc<Mutex<Vec<Value>>>,
@@ -687,6 +803,12 @@ fn shut_down(stop: &AtomicBool, used: &Option<deuri::Settings>) {
     }
 }
 
+fn spawn_new_window() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).spawn();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut auto_agent_view = false;
@@ -708,11 +830,18 @@ fn main() {
     let first_is_page = first.is_some();
     let mut open_panel_on_load = auto_ask.is_some();
 
+    // Extensions: load once; write the bundled sample on first run.
+    extensions::ensure_samples(&config_dir());
+    let loaded_exts = extensions::load_all(&config_dir());
+    let page_init = format!("{PAGE_BOOTSTRAP}\n{}", extensions::combined_script(&loaded_exts));
+    let start_html = START_TEMPLATE.replace("$BG$", &beach_data_url());
+
     let event_loop = EventLoopBuilder::<Msg>::with_user_event().build();
     let window = WindowBuilder::new()
         .with_title("JJ1")
         .with_inner_size(LogicalSize::new(1240.0, 820.0))
         .with_min_inner_size(LogicalSize::new(420.0, 300.0))
+        .with_transparent(true)
         .build(&event_loop)
         .expect("could not create the browser window");
     #[cfg(windows)]
@@ -721,6 +850,9 @@ fn main() {
         if let Ok(icon) = tao::window::Icon::from_resource(1, None) {
             window.set_window_icon(Some(icon));
         }
+        // Frosted translucent backdrop (Windows 11). Harmless if unavailable.
+        let _ = window_vibrancy::apply_acrylic(&window, Some((250, 250, 252, 10)));
+        light_title_bar(&window);
     }
 
     let blocked: Vec<String> = DEFAULT_BLOCKLIST
@@ -736,6 +868,7 @@ fn main() {
     let ui_proxy = proxy.clone();
     let toolbar = WebViewBuilder::new_with_web_context(&mut context)
         .with_bounds(toolbar_bounds(&window))
+        .with_transparent(true)
         .with_html(TOOLBAR_HTML)
         .with_ipc_handler(move |req| {
             let _ = ui_proxy.send_event(Msg::Ui(req.body().clone()));
@@ -745,24 +878,22 @@ fn main() {
 
     let mut tabs: Vec<Tab> = Vec::new();
     let mut next_id = 1usize;
-    let mut active = 0usize; // id of the active tab
+    let mut active = 0usize;
     let mut toolbar_ready = false;
 
-    // Deuri: nothing is loaded until the first message is sent.
     let mut panel: Option<WebView> = None;
     let mut panel_open = false;
     let history: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let mut deuri_busy = false;
     let mut used_settings: Option<deuri::Settings> = None;
-    // A page Deuri opened, and where to send its text once it has loaded.
     let mut pending_read: Option<(usize, mpsc::Sender<String>)> = None;
 
     let start = match first {
         Some(u) => Start::Url(u),
-        None => Start::Html { html: START_HTML.to_string(), label: START_URL },
+        None => Start::Html { html: start_html.clone(), label: START_URL },
     };
-    match open_tab(&window, &mut context, &proxy, &blocked, next_id, start, content_bounds(&window, false)) {
+    match open_tab(&window, &mut context, &proxy, &blocked, &page_init, next_id, start, content_bounds(&window, false)) {
         Ok(tab) => {
             active = tab.id;
             tabs.push(tab);
@@ -774,7 +905,6 @@ fn main() {
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
-        // Push tab strip, address and button state to the toolbar page.
         let sync = |tabs: &[Tab], active: usize, force: bool, deuri_on: bool| {
             let cur = tabs.iter().find(|t| t.id == active);
             let state = json!({
@@ -783,6 +913,7 @@ fn main() {
                     "title": if t.title.is_empty() { t.shown_url().to_string() } else { t.title.clone() },
                     "loading": t.loading,
                     "active": t.id == active,
+                    "favicon": t.favicon,
                 })).collect::<Vec<_>>(),
                 "url": cur.map(|t| t.shown_url()).unwrap_or(""),
                 "back": cur.is_some_and(|t| t.view.can_go_back().unwrap_or(false)),
@@ -806,7 +937,6 @@ fn main() {
             }
         };
 
-        // Commands from the toolbar, page shortcuts and the panel.
         let mut queue: Vec<Value> = Vec::new();
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
@@ -819,16 +949,62 @@ fn main() {
             Event::UserEvent(Msg::Ui(body)) => queue.extend(serde_json::from_str::<Value>(&body).ok()),
             Event::UserEvent(Msg::Key(key)) => match key.as_str() {
                 "t" => queue.push(json!({"c": "new"})),
+                "n" => queue.push(json!({"c": "newwindow"})),
                 "w" => queue.push(json!({"c": "closeactive"})),
                 "l" => queue.push(json!({"c": "focusurl"})),
+                "r" => queue.push(json!({"c": "reload"})),
                 "j" => queue.push(json!({"c": "deuri"})),
                 _ => {}
             },
+            Event::UserEvent(Msg::Favicon { tab, data }) => {
+                if let Some(t) = tabs.iter_mut().find(|t| t.id == tab) {
+                    t.favicon = if data.starts_with("data:") { Some(data) } else { None };
+                }
+                sync(&tabs, active, false, panel_open);
+            }
+            Event::UserEvent(Msg::Navigate { tab, input }) => {
+                if let (Some(url), Some(t)) = (resolve_input(&input), tabs.iter_mut().find(|t| t.id == tab)) {
+                    t.label = None;
+                    t.url = url.clone();
+                    t.loading = true;
+                    t.favicon = None;
+                    let _ = t.view.load_url(&url);
+                    sync(&tabs, active, true, panel_open);
+                }
+            }
+            Event::UserEvent(Msg::Ext { body }) => {
+                if body == "ext:capture" {
+                    #[cfg(windows)]
+                    if tabs.iter().any(|t| t.id == active) {
+                        let scale = window.scale_factor();
+                        let (w, h) = logical_size(&window);
+                        let cw = if panel_open { w - panel_width(w) } else { w };
+                        let path = screenshot::next_path();
+                        let res = screenshot::capture_client_region(
+                            window_hwnd(&window),
+                            0,
+                            (BAR_HEIGHT * scale) as i32,
+                            (cw * scale) as i32,
+                            ((h - BAR_HEIGHT) * scale) as i32,
+                            &path,
+                        );
+                        if let Some(t) = tabs.iter().find(|t| t.id == active) {
+                            let msg = match &res {
+                                Ok(()) => format!("\u{1F4F8} Saved to {}", path.display()),
+                                Err(e) => format!("Screenshot failed: {e}"),
+                            };
+                            let _ = t.view.evaluate_script(&format!("window.jj1&&window.jj1.notify({})", json!(msg)));
+                        }
+                    }
+                }
+            }
             Event::UserEvent(Msg::Load { tab, finished, url }) => {
                 if let Some(t) = tabs.iter_mut().find(|t| t.id == tab) {
                     t.loading = !finished;
-                    // Built-in pages report about:blank; keep their label.
                     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file:") {
+                        if t.url != url {
+                            t.favicon = None;
+                        }
                         t.url = url;
                         t.label = None;
                     }
@@ -880,7 +1056,7 @@ fn main() {
                 let page_url = tabs.iter().find(|t| t.id == tab).map(|t| t.url.clone()).unwrap_or_default();
                 let page = agent_view_page(&page_url, &html);
                 let start = Start::Html { html: page, label: AGENT_VIEW_URL };
-                if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, next_id, start, content_bounds(&window, panel_open)) {
+                if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, &page_init, next_id, start, content_bounds(&window, panel_open)) {
                     active = t.id;
                     tabs.push(t);
                     next_id += 1;
@@ -954,13 +1130,13 @@ fn main() {
                     }
                 },
                 "open_url" | "search_web" => {
-                    // Already checked on the Deuri thread (scheme, blocklist, private network).
                     let url = args["resolved"].as_str().unwrap_or("").to_string();
                     match tabs.iter_mut().find(|t| t.id == active) {
                         Some(t) if !url.is_empty() => {
                             t.label = None;
                             t.url = url.clone();
                             t.loading = true;
+                            t.favicon = None;
                             let _ = t.view.load_url(&url);
                             pending_read = Some((t.id, reply));
                             sync(&tabs, active, true, panel_open);
@@ -988,9 +1164,6 @@ fn main() {
                     if open_panel_on_load && !first_is_page {
                         open_panel_on_load = false;
                         queue.push(json!({"c": "deuri"}));
-                    } else if tabs.iter().any(|t| t.id == active && t.label == Some(START_URL)) {
-                        let _ = toolbar.focus();
-                        let _ = toolbar.evaluate_script("window.focusUrl()");
                     }
                 }
                 "go" => {
@@ -998,6 +1171,7 @@ fn main() {
                         t.label = None;
                         t.url = url.clone();
                         t.loading = true;
+                        t.favicon = None;
                         let _ = t.view.load_url(&url);
                         let _ = t.view.focus();
                         sync(&tabs, active, true, panel_open);
@@ -1012,18 +1186,30 @@ fn main() {
                         };
                     }
                 }
+                "newwindow" => spawn_new_window(),
+                "extensions" => {
+                    let page = extensions_page(&loaded_exts, &extensions::dir(&config_dir()));
+                    let start = Start::Html { html: page, label: EXT_URL };
+                    if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, &page_init, next_id, start, content_bounds(&window, panel_open)) {
+                        active = t.id;
+                        tabs.push(t);
+                        next_id += 1;
+                        show(&tabs, active);
+                        sync(&tabs, active, true, panel_open);
+                    }
+                }
                 "new" | "open" => {
                     let lower = text.to_ascii_lowercase();
                     if !text.is_empty() && !(lower.starts_with("http://") || lower.starts_with("https://")) {
-                        continue; // only web pages open from popups and chat links
+                        continue;
                     }
                     let blank = text.is_empty();
                     let start = if blank {
-                        Start::Html { html: START_HTML.to_string(), label: START_URL }
+                        Start::Html { html: start_html.clone(), label: START_URL }
                     } else {
                         Start::Url(text.clone())
                     };
-                    if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, next_id, start, content_bounds(&window, panel_open)) {
+                    if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, &page_init, next_id, start, content_bounds(&window, panel_open)) {
                         active = t.id;
                         tabs.push(t);
                         next_id += 1;
@@ -1118,6 +1304,15 @@ mod tests {
     }
 
     #[test]
+    fn start_page_embeds_the_beach_image() {
+        let html = START_TEMPLATE.replace("$BG$", &beach_data_url());
+        assert!(html.contains("data:image/jpeg;base64,"));
+        assert!(html.contains("Welcome to Deuri's world"));
+        assert!(html.contains("start your heart out"));
+        assert!(!html.contains("$BG$"));
+    }
+
+    #[test]
     fn agent_view_escapes_page_content() {
         let page = agent_view_page(
             "https://shop.test/x",
@@ -1144,7 +1339,6 @@ mod tests {
         let p3 = page_for_deuri("https://a.test/", &html, 3, "n0");
         assert!(p3.contains("part 3 of 3") && !p3.contains("part=4"));
         assert!(!p3.contains("Links:"), "links only come with part 1");
-        // Out-of-range parts are clamped, not errors.
         assert!(page_for_deuri("https://a.test/", &html, 99, "n0").contains("part 3 of 3"));
 
         let found = find_for_deuri("https://a.test/", &html, "next PAGE", "n0");
@@ -1163,5 +1357,21 @@ mod tests {
         assert!(check_url_for_deuri("http://localhost:8080/", &blocked).is_err());
         assert!(check_url_for_deuri("http://169.254.169.254/latest/meta-data", &blocked).is_err());
         assert_eq!(check_url_for_deuri("https://93.184.216.34/a", &blocked).unwrap(), "https://93.184.216.34/a");
+    }
+
+    #[test]
+    fn extensions_page_lists_installed() {
+        let exts = vec![extensions::Extension {
+            id: "ss-screenshot".into(),
+            name: "SS Screenshot".into(),
+            description: "press S twice".into(),
+            version: "1.0".into(),
+            enabled: true,
+            content_js: String::new(),
+        }];
+        let page = extensions_page(&exts, std::path::Path::new("C:/x/extensions"));
+        assert!(page.contains("SS Screenshot"));
+        assert!(page.contains("enabled"));
+        assert!(page.contains("jj1.captureTab"));
     }
 }

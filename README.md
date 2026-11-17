@@ -66,11 +66,23 @@ jj1 view example.com           # ...on a page
 powershell -File install.ps1   # install for this user, with Start Menu and desktop shortcuts
 ```
 
-`jj1-browser` is a normal window with tabs and an address bar on the system
-WebView (the engine behind Microsoft Edge on Windows), plus JJ1's tracker
-blocking and an **Agent view** button that shows what an AI agent would receive
-for the page you are on. It uses about as much memory as Edge does; the
-lightweight part of JJ1 is the agent side.
+`jj1-browser` is a normal window with tabs, an address bar, favicons and a
+translucent "frosted glass" look, on the system WebView (the engine behind
+Microsoft Edge on Windows). It opens on a beach start page with a search bar,
+blocks trackers, and adds two JJ1-only things: an **Agent view** button (what an
+AI agent would receive for the page) and **Deuri** (below). It uses about as
+much memory as Edge does; the lightweight part of JJ1 is the agent side.
+
+- **Ctrl+N** opens a new window, **Ctrl+T** a new tab, **Ctrl+W** closes one,
+  **Ctrl+L** the address bar, **Ctrl+J** Deuri.
+
+### Extensions
+
+Put your own extensions in `%APPDATA%\jj1\extensions\<name>\` — a `manifest.json`
+and a `content.js` that runs on every page and can call a small `jj1` API
+(`jj1.captureTab()`, `jj1.notify(text)`, `jj1.log(text)`). The puzzle-piece
+button lists what's installed. A bundled example, **SS Screenshot**, saves a PNG
+of the tab to `Pictures\JJ1` when you press **S** twice quickly on a page.
 
 ### Deuri, the local assistant
 

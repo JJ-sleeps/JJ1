@@ -28,7 +28,16 @@ url.workspace = true
 jj1-net.workspace = true
 jj1-distill.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
-windows = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_Storage_Xps",
+] }
+window-vibrancy = "0.6"
+png = "0.17"

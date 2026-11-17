@@ -2,6 +2,8 @@
 //! and the human-facing browser (`jj1-browser`).
 
 pub mod deuri;
+pub mod extensions;
+pub mod screenshot;
 
 use wry::WebView;
 

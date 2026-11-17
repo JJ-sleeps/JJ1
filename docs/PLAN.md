@@ -368,6 +368,35 @@ installed here); no streaming of the model's hidden "thinking" tokens (shown as
 reply budget (`max_reply_tokens`, 3000) counts thinking tokens, so a long
 chain of thought can exhaust it (handled with a clear message, not a hang).
 
+### 2026-11-17 - Browser polish: windows, favicons, extensions, premium look
+
+A batch of human-mode (H1/H2) work on `jj1-browser`, all verified by driving
+the real window with hardware input and screenshots:
+
+| Asked | Done | Verified |
+|---|---|---|
+| New session = new window | Ctrl+N (and a toolbar button) spawn a second `jj1-browser` process = a second independent window | process count 1 -> 2 |
+| Tabs couldn't be closed with the cursor | Root cause: clicking the "x" fired the tab's own mousedown (switch), which rebuilt the tab strip and destroyed the "x" before its click fired. Fixed: the "x" now closes on `mousedown` with `stopPropagation` | clicked the "x" of 3 tabs -> 2; also middle-click closes |
+| Show each site's favicon | A page script fetches the site's icon (same-origin), passes it as a data URL; the tab strip shows it, with a globe fallback | Wikipedia's "W" showed in the tab |
+| A space for my own extensions, working | `%APPDATA%\jj1\extensions\<id>\` (manifest.json + content.js). Enabled scripts are injected into every page with a small `jj1` API (`captureTab`, `notify`, `log`). A puzzle-piece toolbar button opens a built-in page listing them and explaining how to add one | extensions page renders; sample loads |
+| Test extension: hears "SS", full tab screenshot | Bundled `ss-screenshot` extension: press S twice quickly (not while typing) -> `jj1.captureTab()` -> the browser PrintWindow-captures the tab's content region and saves a PNG to `Pictures\JJ1` | S,S -> saved a 1860x1110 PNG of the page, toolbar excluded |
+| Premium look, not basic black: rich white/grey, blurry translucent | Light "frosted glass" chrome (translucent white-grey + `backdrop-filter` blur) over a Windows 11 acrylic window backdrop, forced light regardless of system dark mode, with a light title bar (DWM). The Deuri panel matches | screenshots show the frosted light toolbar + panel |
+| Beautiful start page with a beach image, "Welcome to Deuri's world / start your heart out", and a search bar | New start page: full-bleed HD beach photo (embedded, ~113 KB, no network), the heading and subtitle, and a glass search bar that navigates the tab | screenshot confirms |
+
+New deps: `base64` (embed the photo), `png` (encode screenshots), `window-vibrancy`
+(acrylic), and `windows` GDI/DWM/Xps features. New library modules
+`extensions.rs` and `screenshot.rs`; the WebView request filter moved into the
+shared lib so the browser and the agent worker use the same code. 10 new unit
+tests (extensions, start-page templating, extensions page, screenshot paths).
+
+Known gaps: the extension API is small (`captureTab`/`notify`/`log`) and content
+scripts run in the page, so a hostile page could call the API too (extensions
+are the user's own trusted code); favicons over ~120 KB are skipped; acrylic and
+the screenshot capture are Windows-only; tabs are not draggable/reorderable and
+do not persist across restarts; the screenshot is the visible tab, not the full
+scrollable page. The multi-window model is one OS process per window (simple and
+isolated), not shared state between windows.
+
 ### Next steps
 
 1. Use `jj1` from Claude Code for a real task (registered, not yet exercised).
