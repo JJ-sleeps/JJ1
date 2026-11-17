@@ -1,0 +1,10 @@
+[package]
+name = "jj1-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+url.workspace = true
+reqwest.workspace = true
+encoding_rs.workspace = true

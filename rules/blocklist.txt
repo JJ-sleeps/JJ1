@@ -1,0 +1,32 @@
+# JJ1 default host blocklist. One host per line; subdomains are included.
+# Compiled into the binary. Add your own in config.toml (blocked_hosts = [...]).
+# Ads
+doubleclick.net
+googlesyndication.com
+googleadservices.com
+adservice.google.com
+adnxs.com
+criteo.com
+criteo.net
+taboola.com
+outbrain.com
+amazon-adsystem.com
+pubmatic.com
+rubiconproject.com
+openx.net
+moatads.com
+adsrvr.org
+# Analytics and trackers
+google-analytics.com
+googletagmanager.com
+scorecardresearch.com
+hotjar.com
+mixpanel.com
+segment.io
+quantserve.com
+chartbeat.com
+newrelic.com
+nr-data.net
+fullstory.com
+mouseflow.com
+connect.facebook.net

@@ -1,0 +1,21 @@
+[package]
+name = "jj1-engine-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tier 2: the system WebView (WebView2 / WKWebView / WebKitGTK) behind JJ1"
+
+# The worker process `jj1` starts on demand for pages that need JavaScript.
+[[bin]]
+name = "jj1-view"
+path = "src/bin/view.rs"
+
+# Stand-alone measurement probe used by bench/bench-js.ps1.
+[[bin]]
+name = "jj1-view-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+wry = "0.57"
+tao = "0.37"
+serde_json.workspace = true

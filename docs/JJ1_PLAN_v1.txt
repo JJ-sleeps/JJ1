@@ -1,0 +1,331 @@
+================================================================================
+JJ1  -  A LIGHTWEIGHT, AI-AGENT-NATIVE BROWSER
+Project plan v1.0   (evolved from the original "AETHER-WEB" concept)
+================================================================================
+
+ONE-LINE PITCH
+  JJ1 is a tiny browser that AI agents drive directly. It never paints pixels
+  unless asked. It hands the agent a compact, numbered map of the page instead
+  of 500 KB of HTML or an expensive screenshot, and it speaks MCP natively.
+
+GOALS (in priority order)
+  G1. Lightweight  : target 70-85% less RAM/CPU than headless Chrome for
+                     typical agent workloads (measured, not assumed - see 8).
+  G2. Agent-native : agents act through stable numeric element IDs, never CSS
+                     selectors, and receive small, diffed responses.
+  G3. Safe         : sandboxed, and hardened against prompt injection from
+                     web pages.
+  G4. Executable   : a working single binary (`jj1`) at every milestone; each
+                     milestone is usable on its own.
+
+NON-GOALS (be honest about scope)
+  - Not a replacement for Chrome as a human daily-driver browser.
+  - Not a new JavaScript engine or a new rendering engine written from scratch.
+  - Not a tool for defeating CAPTCHAs, paywalls, or site terms of service.
+
+
+--------------------------------------------------------------------------------
+1. WHAT CHANGED FROM THE ORIGINAL SPEC (AND WHY)
+--------------------------------------------------------------------------------
+  1. "80% less" is now a MEASURED target with a benchmark harness, not a
+     claim. Numbers in the old table were estimates; they are now hypotheses
+     to be validated at Milestone 2.
+  2. The 4-week roadmap is replaced by milestones with exit criteria. Building
+     a network layer, DOM, JS runtime, MCP server and a sandbox in 4 weeks is
+     not realistic for one developer; milestones let you ship value early.
+  3. "Write our own Tier-1 JS/DOM engine (html5ever + QuickJS/Boa)" is now
+     "start with static fetch + distiller, then EMBED an existing engine for
+     JS". Real-world web pages need thousands of Web APIs. Reuse, don't
+     rebuild.
+  4. "Stealth / anti-detection spoofing" is replaced by a COMPATIBILITY
+     PROFILE: an honest, configurable User-Agent and a modern TLS/HTTP2 stack
+     so normal sites load correctly. JJ1 identifies itself, respects
+     robots.txt by default, and does not try to bypass bot protection.
+     (Reasons: legal exposure, an arms race that eats all your time, and
+     it is the first thing that gets a project reported/abused.)
+  5. Added: a permission/policy layer, because an agent-controlled browser
+     with saved logins is a high-value attack target.
+  6. Added: a test plan and a repo layout so the project is buildable.
+
+
+--------------------------------------------------------------------------------
+2. HOW JJ1 GETS ITS LOW RESOURCE USE
+--------------------------------------------------------------------------------
+  [A] Three rendering tiers, cheapest first, escalate only when needed
+        Tier 0  STATIC     HTTP fetch -> HTML parse -> distill. No JS, no
+                           layout, no GPU.  Target 5-20 MB per page.
+        Tier 1  LIGHT-JS   Embedded lightweight JS/DOM engine for pages that
+                           need scripts but not pixels (SPA hydration, forms).
+                           Target 30-80 MB per page.
+        Tier 2  FULL       Real system WebView (WebKitGTK/WPE on Linux,
+                           WKWebView on macOS, WebView2 on Windows) for
+                           pages that break in Tier 1, and for screenshots /
+                           human viewing.  Mounted on demand, torn down after.
+
+      Escalation is automatic and explained: if Tier 0 returns an "empty
+      shell" page (few text nodes, big script bundle), JJ1 retries in Tier 1;
+      if Tier 1 throws unsupported-API errors, it retries in Tier 2. The
+      response tells the agent which tier was used.
+
+  [B] Block waste before it reaches RAM
+        Drop images, fonts, video/audio, trackers and ad domains at the
+        request layer (a rule list, user-editable). CSS is optional: off in
+        Tier 0, on in Tier 2.
+
+  [C] Send the agent a map, not a page
+        The distiller turns the DOM/accessibility tree into a compact "Action
+        Map" plus clean Markdown for reading. Typical payload 800-3,000
+        tokens vs 50k-150k for raw HTML.
+
+  [D] One shared process, cheap tabs
+        A single core process owns networking, cookies and the MCP server;
+        pages are lightweight contexts, not full browser processes. Idle
+        contexts are suspended (DOM serialised to disk) after a timeout.
+
+
+--------------------------------------------------------------------------------
+3. ARCHITECTURE
+--------------------------------------------------------------------------------
+
+   AI agent (Claude Code, OpenCode, Ollama apps, Python, etc.)
+        |
+        |   MCP over stdio  (default)  /  Unix socket or localhost HTTP (opt.)
+        v
+ +-----------------------------------------------------------------------+
+ | 1. AGENT CONTROL PLANE                                                |
+ |    MCP server, tool schemas, action executor, DOM-diff engine,        |
+ |    policy gate (domain allow/deny, confirm-before-submit), audit log  |
+ +-----------------------------------------------------------------------+
+ | 2. DISTILLER                                                          |
+ |    Accessibility-tree extractor, readability/Markdown extractor,      |
+ |    element-ID assigner (stable IDs across diffs), injection scanner   |
+ +-----------------------------------------------------------------------+
+ | 3. EXECUTION TIERS                                                    |
+ |    Tier 0 static | Tier 1 light-JS (embedded) | Tier 2 system WebView |
+ +-----------------------------------------------------------------------+
+ | 4. NETWORK + STORAGE                                                  |
+ |    HTTP/1.1+2 (rustls), DNS, request filter, cache, robots.txt,       |
+ |    cookie jar + session vault (SQLite WAL, encrypted at rest)         |
+ +-----------------------------------------------------------------------+
+ | 5. OS SANDBOX                                                         |
+ |    Linux: seccomp-bpf + namespaces (+ Landlock)   macOS: sandbox-exec |
+ |    Windows: Job Objects + restricted token                            |
+ +-----------------------------------------------------------------------+
+
+
+--------------------------------------------------------------------------------
+4. TECH STACK DECISIONS
+--------------------------------------------------------------------------------
+  Core language ...... Rust (memory safety matters for a program that parses
+                       hostile input all day). Single static binary: `jj1`.
+  HTTP / TLS ......... hyper + rustls (no OpenSSL dependency).
+  HTML parsing ....... html5ever (spec-compliant, fast).  DOM: own thin layer
+                       or `scraper`/`markup5ever_rcdom` for Tier 0.
+  Tier 1 JS engine ... DECISION POINT (decide at Milestone 3 by benchmark):
+        Option A  Embed/drive Lightpanda (Zig, built for AI agents; vendor
+                  reports ~9x faster and ~16x less memory than Chrome; speaks
+                  CDP; still beta, so Web API coverage is incomplete).
+        Option B  QuickJS (rquickjs) + html5ever + hand-written Web APIs.
+                  Smallest, but you own all API coverage. Highest effort.
+        Option C  Skip Tier 1; go straight from Tier 0 to Tier 2.
+                  Lowest effort; highest RAM when JS is needed.
+      Recommendation: start with C (works at M1-M2), add A at M3, keep B as a
+      research option only.
+  Tier 2 engine ...... System WebView via `wry` (the engine behind Tauri) so
+                       JJ1 does not ship a 300 MB Chromium. WPE WebKit is the
+                       headless-friendly option on Linux.  Servo is promising
+                       but still maturing; track it, don't depend on it yet.
+  IPC / protocol ..... MCP (JSON-RPC 2.0) over stdio first; add Unix socket /
+                       localhost HTTP later.  Tool schemas published as JSON.
+  Storage ............ SQLite (WAL) via rusqlite; secrets encrypted with a key
+                       from the OS keychain (keyring crate).
+  Config ............. TOML (`~/.config/jj1/config.toml`).
+  Testing ............ cargo test, wiremock/local fixture server, a corpus of
+                       ~50 real pages saved as snapshots, criterion for perf.
+
+
+--------------------------------------------------------------------------------
+5. THE AGENT API  (MCP TOOLS)
+--------------------------------------------------------------------------------
+  Design rules: few tools, small outputs, deterministic IDs, every response
+  states the tier used and the token size, and errors are actionable.
+
+  jj1_open(url, tier="auto"|"static"|"js"|"full")
+      -> {tab, url, title, tier, markdown, actions:[...], tokens}
+
+  jj1_snapshot(tab, scope="viewport"|"full"|"main")
+      -> Action Map for the current state.  Example:
+           [1] input[text]  "Search"          name=q
+           [2] button       "Go"
+           [3] link         "Pricing"         -> /pricing
+           [4] select       "Country"         options: IN, US, UK (+12)
+
+  jj1_act(tab, id, action="click"|"type"|"select"|"check"|"press"|"scroll",
+          value="")
+      -> waits for network idle / DOM stable, returns ONLY the diff:
+           +[7] link "Order #1042"
+           ~[2] button "Go" (now disabled)
+           -[5] ...
+
+  jj1_read(tab, mode="article"|"table"|"all", max_tokens=2000)
+      -> clean Markdown; tables returned as Markdown/CSV.
+
+  jj1_screenshot(tab, region?)          -> escalates to Tier 2 (on demand).
+
+  jj1_tabs(action="list"|"close"|"switch")
+  jj1_fork_session(session)             -> cloned cookie/auth state for
+                                           parallel agents (copy-on-write).
+  jj1_set_policy(allow=[], deny=[], confirm_actions=[...])
+
+  ID stability: element IDs persist across snapshots while the node exists, so
+  an agent can say "click [2]" after a diff without re-reading the page.
+
+  Safety defaults:
+    - Form submits, purchases and anything on the "confirm" list require an
+      explicit confirmation flag from the agent harness (human-in-the-loop).
+    - Cross-origin navigation can be pinned per session (allow-list).
+
+
+--------------------------------------------------------------------------------
+6. SECURITY MODEL
+--------------------------------------------------------------------------------
+  Threat 1: Malicious page attacks the browser.
+    - Parse and execute in a sandboxed worker process (seccomp/namespaces,
+      read-only FS, no network except via the core's proxy).
+    - Memory-safe language for the core; fuzz the parser and distiller.
+
+  Threat 2: Malicious page attacks the AGENT (prompt injection).
+    - Distiller flags/strips hidden text: display:none, visibility:hidden,
+      zero font-size, off-screen positioning, white-on-white, aria-hidden
+      content, HTML comments, and suspicious instruction-like strings.
+    - All page text is wrapped in clearly delimited "UNTRUSTED PAGE CONTENT"
+      blocks in tool results, so the agent harness can treat it as data.
+    - Honest limitation: no filter catches everything. The policy layer
+      (confirm-before-act, domain allow-lists, no credentials in agent
+      context) is the real defense; the scanner is defense in depth.
+
+  Threat 3: Credential theft via the agent.
+    - Session vault is encrypted; agents never see cookies or passwords,
+      only "logged in as X" state. Auth is injected at the network layer.
+
+  Threat 4: Abuse of JJ1 itself.
+    - Honest User-Agent (`JJ1/x.y`), robots.txt respected by default,
+      per-domain rate limits, no CAPTCHA solving, no fingerprint spoofing.
+
+
+--------------------------------------------------------------------------------
+7. MILESTONES  (each one ships a usable `jj1`)
+--------------------------------------------------------------------------------
+  M0  Skeleton                                                  ~2-3 days
+      Rust workspace, CLI (`jj1 open <url>`), config, logging.
+      Exit: prints title + status for any URL.
+
+  M1  Tier 0 + Distiller                                        ~1-2 weeks
+      hyper/rustls fetch, request filter (images/fonts/trackers), robots.txt,
+      HTML -> Markdown, HTML -> Action Map with stable IDs.
+      Exit: `jj1 open <url> --actions` works on 20 static sites; <25 MB RSS.
+
+  M2  MCP server + benchmark harness                            ~1-2 weeks
+      stdio MCP with jj1_open / snapshot / read / act (links + simple forms in
+      Tier 0).  Benchmark script comparing JJ1 vs headless Chrome (RAM, CPU,
+      time, tokens) on the same 30 pages.
+      Exit: connects to Claude Code; published benchmark table with REAL numbers.
+
+  M3  JS tier                                                   ~2-4 weeks
+      Pick Option A/B/C by benchmark; auto-escalation; DOM-diff engine.
+      Exit: logs into and navigates a React/Next.js demo app.
+
+  M4  Tier 2 WebView + screenshots + human mode                 ~2-3 weeks
+      wry/WPE window on demand; `jj1 view` for a human; screenshot tool.
+      Exit: any page that fails in Tier 1 works in Tier 2.
+
+  M5  Security hardening                                        ~2-3 weeks
+      OS sandbox, injection scanner, policy layer, encrypted vault, fuzzing.
+      Exit: red-team test pages (hidden-instruction fixtures) all flagged.
+
+  M6  Multi-agent + polish                                      ~2 weeks
+      Session forking, tab suspension, packaging (Linux/macOS/Windows),
+      docs, installer, release.
+
+  Realistic total for one developer working steadily: ~3-5 months. M0-M2 gives
+  you something real and demoable within about a month.
+
+
+--------------------------------------------------------------------------------
+8. BENCHMARK METHOD  (so the "80%" is honest)
+--------------------------------------------------------------------------------
+  Compare JJ1 against headless Chrome (and Lightpanda where relevant) on the
+  same machine, same 30-page corpus (news, docs, e-commerce, SPA, forms).
+  Measure: peak RSS (sum of ALL processes), CPU-seconds, wall time to usable
+  result, bytes downloaded, and tokens sent to the model.
+
+  Expected outcome (hypotheses to test, not promises):
+    Static pages ........ very large savings (Tier 0 has no JS/layout/GPU)
+    Heavy SPAs .......... smaller savings (JS must run somewhere)
+    Token payload ....... 10-50x smaller than raw HTML
+  Report medians AND worst cases. If a target isn't met, say so and adjust.
+
+
+--------------------------------------------------------------------------------
+9. REPO LAYOUT
+--------------------------------------------------------------------------------
+  jj1/
+    Cargo.toml                workspace
+    crates/
+      jj1-cli/                `jj1` binary, subcommands
+      jj1-core/               session, tabs, policy, tier escalation
+      jj1-net/                http, filter rules, robots, cookie jar
+      jj1-distill/            DOM -> markdown, action map, injection scan
+      jj1-mcp/                MCP server + tool schemas
+      jj1-engine-js/          Tier 1 adapter (Lightpanda/QuickJS)
+      jj1-engine-view/        Tier 2 adapter (wry/WPE)
+      jj1-sandbox/            OS sandbox shims
+    rules/                    blocklists (ads, trackers, mime rules)
+    fixtures/                 saved pages + injection test pages
+    bench/                    benchmark scripts and results
+    docs/                     this plan, API reference, security notes
+
+
+--------------------------------------------------------------------------------
+10. HOW YOU WILL USE IT  (target UX)
+--------------------------------------------------------------------------------
+  Install:        cargo install --path crates/jj1-cli     (later: prebuilt bins)
+  Try it:         jj1 open https://example.com --actions
+  Agent mode:     jj1 mcp                                  (stdio MCP server)
+  Claude Code:    claude mcp add jj1 -- jj1 mcp
+  Human mode:     jj1 view https://example.com             (Tier 2 window)
+  Config:         ~/.config/jj1/config.toml  (policy, blocklists, tier prefs)
+
+
+--------------------------------------------------------------------------------
+11. RISKS AND MITIGATIONS
+--------------------------------------------------------------------------------
+  R1  Web compatibility gap in the light tier
+      -> Auto-escalate to Tier 2; keep a compatibility-failure corpus.
+  R2  Scope creep (it is easy to start building a whole browser)
+      -> Milestones with hard exit criteria; M2 is the "is this valuable" gate.
+  R3  Savings smaller than hoped on JS-heavy sites
+      -> Measure early (M2), report honestly, optimise where it matters.
+  R4  Prompt-injection defenses overpromised
+      -> Document limits; rely on policy + confirmation, not the scanner alone.
+  R5  Platform differences in WebView and sandbox
+      -> Linux first; treat macOS/Windows as M6.
+  R6  Third-party engine churn (Lightpanda/Servo/WPE are all evolving)
+      -> Keep engines behind a small adapter trait so they can be swapped.
+
+
+--------------------------------------------------------------------------------
+12. FIRST STEPS  (what to do next)
+--------------------------------------------------------------------------------
+  1. Install Rust (rustup) and create the workspace from section 9.
+  2. Build M0 and M1: fetch + distill + action map.
+  3. Add the MCP server (M2) and connect it to Claude Code.
+  4. Run the benchmark. Decide the Tier-1 engine from real numbers.
+
+  When you're ready, the natural next move is to have Claude scaffold M0-M2 as
+  runnable code (a working `jj1` CLI and MCP server) so you can test it
+  immediately.
+
+================================================================================
+END OF PLAN  -  JJ1
+================================================================================

@@ -1,0 +1,15 @@
+[package]
+name = "jj1-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jj1"
+path = "src/main.rs"
+
+[dependencies]
+jj1-core.workspace = true
+jj1-mcp.workspace = true
+clap.workspace = true
+serde_json.workspace = true
