@@ -40,7 +40,7 @@ $init = Send "initialize" @{ protocolVersion = "2025-06-18"; capabilities = @{};
 Check "initialize returns server info" ($init.result.serverInfo.name -eq "jj1")
 $proc.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
 $tools = Send "tools/list" $null
-Check "tools/list returns 6 tools" ($tools.result.tools.Count -eq 6)
+Check "tools/list returns 7 tools" ($tools.result.tools.Count -eq 7)
 
 # 1. open + click a link + diff
 $r = Tool "jj1_open" @{ url = "https://en.wikipedia.org/wiki/Web_browser"; max_tokens = 300; max_actions = 400 }
