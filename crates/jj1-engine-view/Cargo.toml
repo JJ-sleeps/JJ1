@@ -10,6 +10,11 @@ description = "Tier 2: the system WebView (WebView2 / WKWebView / WebKitGTK) beh
 name = "jj1-view"
 path = "src/bin/view.rs"
 
+# The browser a person uses: window, tabs, address bar.
+[[bin]]
+name = "jj1-browser"
+path = "src/bin/browser.rs"
+
 # Stand-alone measurement probe used by bench/bench-js.ps1.
 [[bin]]
 name = "jj1-view-probe"
@@ -21,6 +26,8 @@ tao = "0.37"
 serde_json.workspace = true
 url.workspace = true
 jj1-net.workspace = true
+jj1-distill.workspace = true
+reqwest = { workspace = true, features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"

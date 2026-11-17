@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use jj1_engine_view::{install_request_filter, ResourceKind};
 use jj1_net::{host_matches, points_to_private_network};
 use serde_json::{json, Value};
 use url::Url;
@@ -196,14 +197,6 @@ struct Rules {
     resources_blocked: u32,
 }
 
-/// What kind of thing a sub-resource request is for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResourceKind {
-    /// Images, audio/video and fonts: never needed to read or act on a page.
-    Media,
-    Other,
-}
-
 impl Rules {
     fn is_private(&mut self, url: &Url) -> bool {
         if self.allow_private {
@@ -262,55 +255,11 @@ impl Rules {
     }
 }
 
-/// Intercept every request the page makes (WebView2 only) and answer the ones
-/// the rules refuse with an empty 403, so they never hit the network.
-#[cfg(windows)]
+/// Refuse the sub-resource requests the rules do not want loaded.
 fn install_resource_filter(webview: &WebView, rules: Arc<Mutex<Rules>>) -> Result<(), String> {
-    use webview2_com::Microsoft::Web::WebView2::Win32::{
-        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT,
-        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_MEDIA,
-    };
-    use webview2_com::WebResourceRequestedEventHandler;
-    use windows::core::{w, PWSTR};
-    use wry::WebViewExtWindows;
-
-    let core = webview.webview();
-    let env = webview.environment();
-    unsafe {
-        core.AddWebResourceRequestedFilter(w!("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
-            .map_err(|e| e.to_string())?;
-        let handler = WebResourceRequestedEventHandler::create(Box::new(move |_sender, args| {
-            let Some(args) = args else { return Ok(()) };
-            let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
-            args.ResourceContext(&mut context)?;
-            let request = args.Request()?;
-            let mut uri = PWSTR::null();
-            request.Uri(&mut uri)?;
-            let url = webview2_com::take_pwstr(uri);
-            let kind = if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE
-                || context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_MEDIA
-                || context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT
-            {
-                ResourceKind::Media
-            } else {
-                ResourceKind::Other
-            };
-            let block = rules.lock().map(|mut r| r.blocks_resource(kind, &url)).unwrap_or(false);
-            if block {
-                let response = env.CreateWebResourceResponse(None, 403, w!("Blocked by JJ1"), w!(""))?;
-                args.SetResponse(&response)?;
-            }
-            Ok(())
-        }));
-        let mut token = Default::default();
-        core.add_WebResourceRequested(&handler, &mut token).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn install_resource_filter(_webview: &WebView, _rules: Arc<Mutex<Rules>>) -> Result<(), String> {
-    Err("sub-resource filtering is only implemented for WebView2".into())
+    install_request_filter(webview, move |kind, url| {
+        rules.lock().map(|mut r| r.blocks_resource(kind, url)).unwrap_or(false)
+    })
 }
 
 enum Phase {

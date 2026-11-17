@@ -42,6 +42,14 @@ enum Cmd {
     },
     /// Run as an MCP server on stdin/stdout (for Claude Code and other agents)
     Mcp,
+    /// Open the JJ1 browser window (for a person)
+    View {
+        /// Address or search to open
+        url: Option<String>,
+        /// Also open the Agent view of the page
+        #[arg(long)]
+        agent_view: bool,
+    },
     /// Show the config file location and the effective settings
     Config {
         /// Write a config file with the default settings if none exists
@@ -79,6 +87,23 @@ fn run(cli: Cli) -> Result<(), String> {
                 if path.exists() { "loaded" } else { "not present, showing defaults" },
                 cfg.to_toml()
             );
+            Ok(())
+        }
+        Cmd::View { url, agent_view } => {
+            let name = if cfg!(windows) { "jj1-browser.exe" } else { "jj1-browser" };
+            let exe = std::env::current_exe()
+                .ok()
+                .and_then(|me| me.parent().map(|dir| dir.join(name)))
+                .filter(|p| p.exists())
+                .ok_or_else(|| format!("{name} is not installed next to jj1. Build it with build.ps1."))?;
+            let mut cmd = std::process::Command::new(&exe);
+            if let Some(u) = url {
+                cmd.arg(u);
+            }
+            if agent_view {
+                cmd.arg("--agent-view");
+            }
+            cmd.spawn().map_err(|e| format!("could not start {}: {e}", exe.display()))?;
             Ok(())
         }
         Cmd::Mcp => {

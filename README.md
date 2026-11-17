@@ -58,6 +58,42 @@ Connect it to Claude Code:
 claude mcp add jj1 -- jj1 mcp
 ```
 
+## Use it as a browser
+
+```
+jj1 view                       # open the JJ1 browser window
+jj1 view example.com           # ...on a page
+powershell -File install.ps1   # install for this user, with Start Menu and desktop shortcuts
+```
+
+`jj1-browser` is a normal window with tabs and an address bar on the system
+WebView (the engine behind Microsoft Edge on Windows), plus JJ1's tracker
+blocking and an **Agent view** button that shows what an AI agent would receive
+for the page you are on. It uses about as much memory as Edge does; the
+lightweight part of JJ1 is the agent side.
+
+### Deuri, the local assistant
+
+The **Deuri** button (or Ctrl+J) opens a chat panel backed by a model you run
+locally in [LM Studio](https://lmstudio.ai) — no cloud, nothing leaves your
+machine. Deuri can read the page you are on, find things on it, search the web
+and open pages, all in your active tab.
+
+The model is loaded **only when you send your first message** (not when the
+browser starts), given a 30k-token context, and unloaded when it sits idle or
+when you close the browser. Settings live in `%APPDATA%\jj1\deuri.json`
+(model name, context length, server URL, idle timeout):
+
+```json
+{ "model": "bonsai-2-27b-ternary-crack", "identifier": "deuri",
+  "context_length": 30000, "idle_unload_secs": 600,
+  "server": "http://127.0.0.1:1234" }
+```
+
+To use it: install LM Studio, download a chat model (Deuri works best with a
+tool-capable one), and make sure the `lms` CLI is on its default path. Deuri
+starts LM Studio's local server itself on the first message.
+
 ## MCP tools
 
 | Tool | What it does |
@@ -126,7 +162,7 @@ Benchmark results are in [bench/results](bench/results).
 crates/jj1-net      fetch, redirects, robots.txt, blocklist, rate limit
 crates/jj1-distill  HTML -> Markdown, action map, injection scan
 crates/jj1-core     config, policy, session, tabs, IDs, diffs, forms, engine trait
-crates/jj1-engine-view  `jj1-view` WebView worker (and a benchmark probe)
+crates/jj1-engine-view  `jj1-view` WebView worker, `jj1-browser` window, benchmark probe
 crates/jj1-mcp      MCP stdio server
 crates/jj1-cli      the `jj1` binary
 rules/              default host blocklist

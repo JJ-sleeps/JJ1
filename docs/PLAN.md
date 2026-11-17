@@ -271,6 +271,103 @@ Still open after this round:
 - The live tests are skipped (with a message) if `jj1-view` is not built, so a
   green `cargo test` on a machine without it proves less.
 
+### 2026-11-17 - Human mode started: `jj1-browser`
+
+Scope change, stated plainly: the v1 plan listed "a replacement for Chrome as
+a human daily-driver" as a non-goal. The user now wants JJ1 usable like any
+other browser from an .exe. The honest position is this: `jj1-browser` is a
+thin window around the system WebView (the same engine as Microsoft Edge on
+Windows). It will render sites as Edge does and use about as much memory
+(477 MB working set / 311 MB private for one Wikipedia tab, measured). It is
+not lighter than Edge and is not meant to be; what it adds is JJ1's tracker
+blocking and a view of what an agent sees.
+
+Stages:
+
+| | Scope | Status |
+|---|---|---|
+| H1 | Window, tabs, address bar (URL or search), back/forward/reload, popups open as tabs, page titles, keyboard shortcuts (Ctrl+T/W/L/R + Ctrl+J), start page, persistent profile, tracker blocking, **Agent view**, app icon, `jj1 view`, per-user install script | built |
+| H1+ | **Deuri**: a local-model (LM Studio / Bonsai 2) chat panel that reads and navigates the active tab, loaded only when a message is sent, 30k context | built (see below) |
+| H2 | Things people expect daily: downloads list, history and bookmarks, find in page, zoom, settings page, restore tabs, private window | not started |
+| H3 | Distribution: real installer, updates, code signing, optional "default browser" registration | not started |
+
+What exists (H1):
+
+- `jj1-browser.exe [url] [--agent-view]`, also started by `jj1 view [url]`.
+- The toolbar is a small web page in its own child WebView; each tab is
+  another child WebView. Commands travel over IPC to the Rust side.
+- Pages can send the browser exactly three shortcut requests and nothing else.
+- **Agent view** distils the current page with the same code the agent side
+  uses and shows token counts, the text, the action map and anything the
+  injection scan flagged.
+- Requests to hosts on the blocklist are refused; images and fonts load.
+- Browsing data persists in `%APPDATA%\jj1\browser-profile`, separate from
+  the agent side's throwaway profiles.
+- `install.ps1` copies the programs to `%LOCALAPPDATA%\Programs\JJ1` and adds
+  Start Menu and desktop shortcuts; `-Uninstall` removes them. It does not
+  touch PATH, the registry or the default browser.
+
+Verified: the window opens and renders pages; the tab strip, address bar,
+title and icon show correctly; Agent view opens in a new tab with real numbers;
+`jj1 view` launches it. Unit tests cover address-bar input handling and
+HTML-escaping in Agent view.
+
+**Not verified:** nobody has clicked through it yet. Tab switching and closing,
+typing in the address bar, back/forward, reload, new tab and the keyboard
+shortcuts are written but have only been compiled, not exercised.
+
+Known gaps in H1: it sends the WebView's normal user agent (no JJ1 token);
+no downloads UI beyond the WebView's own; no history, bookmarks, find, zoom
+controls or settings; one window only; Windows only.
+
+### 2026-11-17 - Deuri: a local-model assistant inside the browser
+
+A chat panel in `jj1-browser`, backed by a model the user runs locally in
+LM Studio (here: Bonsai 2, `bonsai-2-27b-ternary-crack`). New module
+`crates/jj1-engine-view/src/deuri.rs` (the LM Studio client, tool loop and
+context trimming) and a side panel + tools wired into `browser.rs`.
+
+Requirements the user set, and how each is met:
+
+| Asked | How |
+|---|---|
+| An agent "Deuri" inside the browser | Toolbar button + Ctrl+J side panel, chat UI with streaming replies, "New chat" |
+| Linked to the local LLM Bonsai 2 | Talks to LM Studio's OpenAI-compatible server at `http://127.0.0.1:1234`; model/identifier set in `deuri.json` |
+| Load **only when a chat is sent** | Nothing touches LM Studio on browser start. On the first message Deuri starts the server if needed and `lms load`s the model; **verified**: no model at launch, loaded 3 s after the first message |
+| ~30k tokens per chat | Model is loaded with a 30,000-token context (`--context-length`); history is trimmed to fit (old page content stubbed first, then whole old turns), leaving room for the reply |
+
+How it works:
+
+- **Lazy, self-releasing.** `ensure_loaded` runs on the first message only. The
+  model is loaded with `--ttl 600`, so LM Studio unloads it after 10 min idle;
+  the browser also unloads it on exit (`unload_on_exit`, default on). Verified
+  both: 3 s cold load, and unloaded when the window closed.
+- **Tools over the active tab.** Deuri can `read_page` (the current tab,
+  distilled, in ~5k-token parts), `find_on_page`, `open_url` and `search_web`
+  (both navigate the active tab and read the result). The event loop runs the
+  tool in the WebView; the model thread waits for the result. It cannot click,
+  type or submit yet.
+- **Safety.** Page text reaches the model wrapped in `UNTRUSTED_PAGE_CONTENT`
+  markers with a per-run nonce; the system prompt tells Deuri to treat it as
+  data. `open_url`/`search_web` are refused for non-http(s), blocklisted hosts
+  and private-network addresses, so a page cannot talk the model into opening
+  the user's router. Streaming can be stopped mid-reply.
+- **Config.** `deuri.json` in `%APPDATA%\jj1` is written with defaults on first
+  run: model, identifier, `context_length`, `idle_unload_secs`, server URL,
+  `max_reply_tokens`, `temperature`, `unload_on_exit`, `lms_path`.
+
+Verified against the real model: asked "What is this page about? Name two
+authors quoted on it." on quotes.toscrape.com; Deuri called `read_page` and
+answered correctly (Einstein, Austen), context panel showed ~2.1k of 30.0k
+tokens. 7 unit tests in `jj1-engine-view` (stream reassembly, history trimming,
+page-part wrapping, URL guards, address-bar input, agent-view escaping).
+
+Known gaps in Deuri: LM Studio only (no Ollama path, though Ollama is also
+installed here); no streaming of the model's hidden "thinking" tokens (shown as
+"Thinking..."); tools are read/navigate only; one conversation at a time; the
+reply budget (`max_reply_tokens`, 3000) counts thinking tokens, so a long
+chain of thought can exhaust it (handled with a clear message, not a hang).
+
 ### Next steps
 
 1. Use `jj1` from Claude Code for a real task (registered, not yet exercised).
