@@ -18,16 +18,13 @@ mostly. There are two tiers:
 ## Build
 
 ```
-cargo build --release
+powershell -File build.ps1
 ```
 
-This builds `jj1` and the WebView worker `jj1-view`, which must sit in the same
-folder. On Windows with the GNU toolchain, `WebView2Loader.dll` must be there
-too; copy it once from the build output:
-
-```
-copy <target-dir>\release\build\webview2-com-sys-*\out\x64\WebView2Loader.dll <target-dir>\release\
-```
+This runs `cargo build --release`, which builds `jj1` and the WebView worker
+`jj1-view` into the same folder, and copies `WebView2Loader.dll` beside them
+(needed on Windows with the GNU toolchain). `build.ps1 -Debug` does the same
+for the debug profile that `cargo test` uses.
 
 Without the worker, `jj1` still runs; JavaScript pages are then reported as
 such instead of rendered.
@@ -69,6 +66,7 @@ claude mcp add jj1 -- jj1 mcp
 | `jj1_snapshot(tab, scope, limit, offset)` | The action map of a tab |
 | `jj1_act(tab, id, action, value, confirm)` | `click`, `type`, `select`, `check`, `press`, `scroll`; returns the diff |
 | `jj1_read(tab, mode, max_tokens, page, links)` | Page text as Markdown, in pages (`article`, `all`, `table`) |
+| `jj1_find(tab, query, limit)` | Elements and text lines containing all the words; cheaper than reading the page |
 | `jj1_tabs(action, tab)` | `list`, `close`, `switch` |
 | `jj1_set_policy(allow, deny, confirm_actions)` | Tighten the policy for this session |
 
@@ -93,6 +91,13 @@ across navigations within a tab.
   `confirm=true`.
 - Allow/deny domain lists, the tracker blocklist and robots.txt are checked on
   every redirect hop.
+- Localhost and private-network addresses are refused unless you set
+  `allow_private_network = true`, so a page cannot aim the browser at services
+  inside your network.
+- In the WebView tier, images, media, fonts and requests to blocklisted hosts
+  are not loaded, and popups and downloads are refused.
+- Live tabs left idle for two minutes are suspended to free memory and reload
+  when used again.
 - The agent can tighten the policy but not loosen it (unless you set
   `agent_can_loosen = true` in `config.toml`).
 - JJ1 identifies itself honestly (`JJ1/<version>`) and does not try to get
@@ -101,13 +106,13 @@ across navigations within a tab.
 Limits are listed in [docs/PLAN.md](docs/PLAN.md). The important ones: in the
 static tier there is no CSS engine (hidden-text detection only sees attributes,
 inline styles and common utility classes); in the WebView tier sub-resources
-are not filtered and script-driven data sends cannot be confirmation-gated;
-and there is no OS sandbox yet.
+filtering is WebView2-only and script-driven data sends cannot be
+confirmation-gated; and there is no OS sandbox yet.
 
 ## Test
 
 ```
-cargo test
+cargo test                                                    # unit tests + offline end-to-end tests (local test site)
 powershell -File bench\mcp-smoke.ps1 -Jj1 <path to jj1.exe>   # static tier, end to end over MCP
 powershell -File bench\mcp-live.ps1 -Jj1 <path to jj1.exe>    # WebView tier, end to end over MCP
 powershell -File bench\bench.ps1 -Jj1 <path to jj1.exe>       # JJ1 vs headless Chrome/Edge

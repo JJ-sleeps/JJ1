@@ -239,13 +239,43 @@ Known gaps in the WebView tier (stated, not hidden):
   (copied by hand from the `webview2-com-sys` build output).
 - `jj1 open --stats` reports only the `jj1` process, not the worker.
 
+### 2026-11-17 - Improvement round
+
+Chosen by asking where JJ1 was weakest against its own goals (safe,
+lightweight, agent-native, always runnable):
+
+| Area | Problem | What changed | Result |
+|---|---|---|---|
+| Safe | A web page could steer the agent's browser at `localhost`, the home router or a cloud metadata address | Loopback, private, link-local, CGNAT and IPv6 equivalents are refused in both tiers (names are resolved first). `allow_private_network` in config turns it off. | Covered by unit and end-to-end tests |
+| Lightweight | A forgotten live tab held about 350 MB for the whole session | Live tabs idle for `live_idle_secs` (default 120) are suspended: the worker ends, the last content is kept, and the tab reloads on its next snapshot or action. The MCP server checks every 5 s, also while the agent is quiet. | Memory returns to about 10 MB; element IDs survive the reload; typed-in values do not |
+| Lightweight / safe | The WebView loaded every image, font and tracker | Requests for images, media and fonts, and anything from blocklisted or denied hosts, are answered with an empty 403 inside the WebView (WebView2 only). `webview_block_media = false` turns it off. | 25 requests blocked on bbc.com/news, 42 on a Wikipedia article; pages settle about 15-25% sooner; memory only 3-9% lower |
+| Agent-native | Finding one link on a big page meant reading the page | New tool `jj1_find(tab, query)`: elements and text lines containing all the words | One call, a few hundred tokens |
+| Always runnable | End-to-end tests needed real websites; nothing covered a framework-style login | `crates/jj1-core/tests/e2e.rs`: a local test site and 5 tests, run by `cargo test`. Includes a single-page app with controlled inputs, fetch and `pushState`, a wrong-then-right login, a `role=button` control, stylesheet-hidden injected text, and idle suspension. | All pass offline in about 14 s |
+| Always runnable | The loader DLL had to be copied by hand | `build.ps1` builds and copies it | |
+
+Tests now: 28 unit tests, 5 offline end-to-end tests, 20 static and 15 live
+checks against real sites. All pass.
+
+On the M3 exit criterion: the offline SPA test behaves the way React apps do
+(controlled inputs that only react to input events, client-side routing), and
+it passes. It is hand-written JavaScript, not React itself, so the criterion's
+literal wording is still not met.
+
+Still open after this round:
+
+- The private-network guard resolves a name and then lets the HTTP client
+  resolve it again, so a DNS answer that changes in between (DNS rebinding) is
+  not caught. Sub-resource requests *inside* the WebView are not checked
+  against it either.
+- Sub-resource filtering exists only for WebView2.
+- The live tests are skipped (with a message) if `jj1-view` is not built, so a
+  green `cargo test` on a machine without it proves less.
+
 ### Next steps
 
 1. Use `jj1` from Claude Code for a real task (registered, not yet exercised).
 2. `git init` and first commit (not done; nothing has been committed).
-3. Finish M3: test a login in a React/Next.js app; close idle live tabs after
-   a timeout; filter sub-resources in the WebView (needs WebView2's
-   WebResourceRequested, which `wry` does not expose directly).
+3. Finish M3: test a login in a real React/Next.js app.
 4. M4 remainder: screenshots and `jj1 view` (the WebView itself is in place).
 5. Smaller items found while building: `<base>`-less relative forms are
    handled, but `<style>`-sheet hidden text is not detected; cookies are
