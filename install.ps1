@@ -22,10 +22,10 @@ if ($Uninstall) {
 
 $target = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory
 $src = Join-Path $target "release"
-if (-not (Test-Path (Join-Path $src "jj1-browser.exe"))) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "build.ps1")
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-}
+# Always (re)build: cargo is incremental, so this is quick when nothing changed,
+# and it stops an old release build from being installed over newer source.
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "build.ps1")
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 New-Item -ItemType Directory -Force $dest | Out-Null
 $files = "jj1.exe", "jj1-view.exe", "jj1-browser.exe", "WebView2Loader.dll"

@@ -209,6 +209,37 @@ fn loaded_context(settings: &Settings) -> Result<Option<u64>, String> {
     }))
 }
 
+/// Model key of the model loaded under our identifier (from `lms ps`).
+fn loaded_model_key(settings: &Settings) -> Option<String> {
+    let out = run_lms(settings, &["ps", "--json"]).ok()?;
+    let v: Value = serde_json::from_str(out.trim()).ok()?;
+    v.as_array()?
+        .iter()
+        .find(|m| m["identifier"].as_str() == Some(settings.identifier.as_str()))
+        .and_then(|m| m["modelKey"].as_str().map(str::to_string))
+}
+
+/// The chat models installed in LM Studio (`lms ls`), each with its file's
+/// absolute path under `"file"`. Embedding and image models are left out.
+pub fn list_models(settings: &Settings) -> Result<Vec<Value>, String> {
+    let out = run_lms(settings, &["ls", "--json"])?;
+    let start = out.find('[').ok_or("lms ls gave no model list")?;
+    let v: Value = serde_json::from_str(out[start..].trim()).map_err(|e| format!("lms ls: {e}"))?;
+    let models = settings.home().join("models");
+    Ok(v.as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| m["type"].as_str() == Some("llm") && !m["architecture"].as_str().unwrap_or("").contains("image"))
+        .map(|mut m| {
+            if let Some(rel) = m["path"].as_str() {
+                m["file"] = json!(models.join(rel).to_string_lossy());
+            }
+            m
+        })
+        .collect())
+}
+
 /// LM Studio's model key for a model folder: the folder name, lower-cased,
 /// with a trailing "-gguf" removed (`Bonsai-2-27B-Ternary-CRACK-GGUF` ->
 /// `bonsai-2-27b-ternary-crack`).
@@ -307,10 +338,17 @@ pub fn ensure_loaded(settings: &Settings, emit: &dyn Fn(Event)) -> Result<(), St
     };
     let wanted = settings.context_length as u64;
     match state {
-        // LM Studio rounds the context up a little (30000 -> 30208).
-        Some(ctx) if ctx >= wanted && ctx <= wanted + wanted / 10 => return Ok(()),
+        // LM Studio rounds the context up a little (30000 -> 30208). A
+        // different model under our identifier (the user switched) reloads too.
+        Some(ctx)
+            if ctx >= wanted
+                && ctx <= wanted + wanted / 10
+                && loaded_model_key(settings).is_none_or(|k| k.eq_ignore_ascii_case(&settings.model)) =>
+        {
+            return Ok(())
+        }
         Some(_) => {
-            emit(Event::Status("Reloading the model with the configured context size...".into()));
+            emit(Event::Status("Reloading the model with the new settings...".into()));
             let _ = run_lms(settings, &["unload", &settings.identifier]);
         }
         None => {}
