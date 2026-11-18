@@ -85,8 +85,31 @@ html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,"Segoe UI",sa
 #url:focus{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
 #icon,.tbtn{width:34px;height:34px;border:0;background:none;color:var(--fg);border-radius:50%;cursor:pointer;font-size:18px;flex:none}
 .pill{height:34px;border:1px solid var(--line);border-radius:18px;padding:0 15px;white-space:nowrap}
-#deuri.on,#deuri.on:hover{background:var(--acc);border-color:var(--acc);color:#fff}
 #tools{display:flex;gap:1px;margin:0 2px}
+/* Deuri button - gradient with conic-gradient glow (Uiverse, Spacious74) */
+#deuri{padding:0 17px;height:34px;border:none;font:600 13px system-ui,"Segoe UI",sans-serif;cursor:pointer;position:relative;
+  background:linear-gradient(90deg,#5bfcc4,#f593e4,#71a4f0);border-radius:17px;color:#fff;transition:all .3s ease;
+  box-shadow:inset 0 0 5px #ffffffa9,inset 0 19px 17px #000,0 4px 8px #000000aa;text-shadow:1px 1px 1px #000;flex:none;display:flex;align-items:center}
+#deuri::before{content:"";position:absolute;inset:0;margin:auto;border-radius:17px;filter:blur(0);z-index:-1;box-shadow:none;
+  background:conic-gradient(#00000000 80deg,#40baf7,#f34ad7,#5bfcc4,#00000000 280deg);transition:all .3s ease}
+#deuri:hover::before,#deuri.on::before{filter:blur(13px)}
+#deuri:active::before{filter:blur(5px);transform:translateY(1px)}
+#deuri:active,#deuri.on{box-shadow:inset 0 0 5px #ffffffa9,inset 0 19px 17px #000}
+/* Agent view button - dark glitch text (Uiverse, Galahhad) */
+#agent{box-sizing:border-box;padding:0 15px;height:34px;display:flex;align-items:center;justify-content:center;
+  color:#fff;font:600 13px Menlo,Consolas,"Roboto Mono",monospace;background:rgb(41,41,41);border:none;cursor:pointer;
+  transition:.3s;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.14);border-radius:10px;flex:none}
+#agent span{letter-spacing:.08rem;transition:.3s;box-sizing:border-box;position:relative;background:inherit}
+#agent span::before{box-sizing:border-box;position:absolute;content:"";background:inherit}
+#agent:hover,#agent:focus{background:rgb(51,51,51)}
+#agent:hover span,#agent:focus span{color:#FAC921}
+#agent:hover span::before,#agent:focus span::before{animation:chitchat linear both 1.2s}
+@keyframes chitchat{
+  0%{content:"#"}5%{content:"."}10%{content:"^{"}15%{content:"-!"}20%{content:"#$_"}25%{content:"№:0"}
+  30%{content:"#{+."}35%{content:"@}-?"}40%{content:"?{4@%"}45%{content:"=.,^!"}50%{content:"?2@%"}
+  55%{content:"\\;1}]"}60%{content:"?{%:%";right:0}65%{content:"|{f[4";right:0}70%{content:"{4%0%";right:0}
+  75%{content:"'1_0<";right:0}80%{content:"{0%";right:0}85%{content:"]>'";right:0}90%{content:"4";right:0}
+  95%{content:"2";right:0}100%{content:"";right:0}}
 </style></head><body>
 <div id="tabs"></div>
 <div id="bar">
@@ -94,8 +117,8 @@ html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,"Segoe UI",sa
   <button class="nav" id="fwd" title="Forward (Alt+Right)">&#8594;</button>
   <button class="nav" id="reload" title="Reload (Ctrl+R)">&#8635;</button>
   <input id="url" spellcheck="false" autocomplete="off" placeholder="Search or enter address">
-  <button class="pill" id="deuri" title="Chat with Deuri, the local assistant (Ctrl+J)">Deuri</button>
-  <button class="pill" id="agent" title="What an AI agent receives for this page">Agent view</button>
+  <button id="deuri" title="Chat with Deuri, the local assistant (Ctrl+J)">Deuri</button>
+  <button id="agent" title="What an AI agent receives for this page"><span>Agent view</span></button>
   <span id="tools">
     <button class="tbtn" data-c="history" title="History">&#128339;</button>
     <button class="tbtn" data-c="extensions" title="Extensions">&#129513;</button>
