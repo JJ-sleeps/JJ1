@@ -4,6 +4,8 @@
 //! and prompt-injection findings.
 
 pub mod actions;
+pub mod audit;
+pub mod cite;
 pub mod dom;
 pub mod markdown;
 pub mod scan;

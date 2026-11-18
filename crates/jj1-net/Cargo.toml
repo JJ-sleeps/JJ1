@@ -8,3 +8,7 @@ license.workspace = true
 url.workspace = true
 reqwest.workspace = true
 encoding_rs.workspace = true
+ed25519-dalek = "2"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"

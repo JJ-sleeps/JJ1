@@ -2,7 +2,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use jj1_core::{Config, Session};
+use jj1_core::{BotAuth, Config, OsVault, Session, Vault};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -50,12 +50,51 @@ enum Cmd {
         #[arg(long)]
         agent_view: bool,
     },
+    /// Score how well a page works for AI agents (and screen readers), with fixes
+    Audit {
+        /// URL to audit (or, with --file, the URL the file pretends to come from)
+        url: String,
+        /// static (what lightweight agents see), auto, or full (after JavaScript)
+        #[arg(long, default_value = "static")]
+        tier: String,
+        /// Read HTML from this local file instead of the network
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// Exit with an error when the score is below this (for CI)
+        #[arg(long, value_name = "N")]
+        min_score: Option<u32>,
+    },
+    /// Saved sign-ins for jj1_login (kept in Windows Credential Manager)
+    Vault {
+        #[command(subcommand)]
+        cmd: VaultCmd,
+    },
+    /// Show this install's request-signing key (Web Bot Auth) and how to publish it
+    Identity,
     /// Show the config file location and the effective settings
     Config {
         /// Write a config file with the default settings if none exists
         #[arg(long)]
         init: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum VaultCmd {
+    /// Save a sign-in for a site; the password is asked for and not shown
+    Add {
+        /// The site, e.g. example.com (also covers its subdomains)
+        host: String,
+        /// Username or email for that site
+        username: String,
+    },
+    /// List saved sign-ins (sites and usernames only)
+    List,
+    /// Delete the saved sign-in for a site
+    Remove { host: String },
 }
 
 fn main() -> ExitCode {
@@ -104,6 +143,91 @@ fn run(cli: Cli) -> Result<(), String> {
                 cmd.arg("--agent-view");
             }
             cmd.spawn().map_err(|e| format!("could not start {}: {e}", exe.display()))?;
+            Ok(())
+        }
+        Cmd::Audit { url, tier, file, json, min_score } => {
+            let mut session = Session::new(Config::load()?)?;
+            let id = match file {
+                Some(path) => {
+                    let html = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                    session.open_html(html, &url)?
+                }
+                None => session.open(&url, &tier)?,
+            };
+            let a = session.audit_tab(id)?;
+            if json {
+                let checks: Vec<_> = a
+                    .checks
+                    .iter()
+                    .map(|c| {
+                        json!({"id": c.id, "severity": c.severity.as_str(), "title": c.title, "advice": c.advice,
+                               "count": c.count, "penalty": c.penalty, "examples": c.examples})
+                    })
+                    .collect();
+                let out = json!({"url": a.url, "title": a.title, "score": a.score, "grade": a.grade, "actions": a.actions,
+                                 "page_tokens": a.page_tokens, "html_tokens": a.html_tokens, "checks": checks});
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            } else {
+                print!("{}", a.report());
+            }
+            match min_score {
+                Some(min) if a.score < min => Err(format!("score {} is below the minimum {min}", a.score)),
+                _ => Ok(()),
+            }
+        }
+        Cmd::Vault { cmd } => {
+            let mut vault = OsVault;
+            match cmd {
+                VaultCmd::Add { host, username } => {
+                    let host = jj1_core::normalize_host(&host);
+                    let pw = jj1_core::vault::read_secret(&format!("Password for {username} on {host} (not shown): "))?;
+                    if pw.is_empty() {
+                        return Err("No password given; nothing saved.".into());
+                    }
+                    vault.save(&host, &username, &pw)?;
+                    println!("Saved the sign-in for {username} on {host}. Agents can use it with jj1_login on {host} but never see it.");
+                }
+                VaultCmd::List => {
+                    let list = vault.list()?;
+                    if list.is_empty() {
+                        println!("No saved sign-ins. Add one with: jj1 vault add <site> <username>");
+                    }
+                    for (host, user) in list {
+                        println!("{host}\t{user}");
+                    }
+                }
+                VaultCmd::Remove { host } => {
+                    let host = jj1_core::normalize_host(&host);
+                    if vault.remove(&host)? {
+                        println!("Removed the sign-in for {host}.");
+                    } else {
+                        println!("No saved sign-in for {host}.");
+                    }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Identity => {
+            let cfg = Config::load()?;
+            let path = jj1_core::bot_key_path();
+            let existed = path.exists();
+            let seed = jj1_core::botauth_seed(&path)?;
+            let agent = cfg.bot_auth.signature_agent.trim().to_string();
+            let auth = BotAuth::new(seed, Some(agent.clone()));
+            println!("Signing key: {}{}", path.display(), if existed { "" } else { " (just created)" });
+            println!("keyid: {}", auth.keyid());
+            println!(
+                "signing: {}",
+                if cfg.bot_auth.enabled { "on" } else { "off (set [bot_auth] enabled = true in config.toml)" }
+            );
+            println!("\nPublish this JSON at <your site>/.well-known/http-message-signatures-directory");
+            println!("(served as application/http-message-signatures-directory+json):\n");
+            println!("{}", auth.directory_json());
+            println!(
+                "\nThen set in {}:\n\n[bot_auth]\nenabled = true\nsignature_agent = \"{}\"",
+                Config::path().display(),
+                if agent.is_empty() { "https://your-site.example" } else { &agent }
+            );
             Ok(())
         }
         Cmd::Mcp => {

@@ -17,6 +17,8 @@ use url::Url;
 mod robots;
 pub use robots::Robots;
 
+pub mod botauth;
+
 /// Default host blocklist, compiled in from `rules/blocklist.txt`.
 pub const DEFAULT_BLOCKLIST: &str = include_str!("../../../rules/blocklist.txt");
 
@@ -37,6 +39,8 @@ pub struct NetConfig {
     /// Off by default: a web page must not be able to steer the agent's
     /// browser at services inside the user's own network.
     pub allow_private_network: bool,
+    /// Sign every request (Web Bot Auth) so sites can verify it is JJ1.
+    pub bot_auth: Option<botauth::BotAuth>,
 }
 
 impl Default for NetConfig {
@@ -53,6 +57,7 @@ impl Default for NetConfig {
             min_interval_ms: 200,
             blocked_hosts: Vec::new(),
             allow_private_network: false,
+            bot_auth: None,
         }
     }
 }
@@ -244,6 +249,7 @@ impl Net {
                         .body(body)
                 }
             };
+            let builder = self.sign(builder, &url);
             let resp = builder.send().map_err(|e| NetError::Http(chain(&e)))?;
             let status = resp.status();
 
@@ -260,6 +266,14 @@ impl Net {
             return self.read_page(resp, url, start, hop);
         }
         Err(NetError::TooManyRedirects(url.to_string()))
+    }
+
+    /// Add Web Bot Auth signature headers for `url`, when signing is on.
+    fn sign(&self, builder: reqwest::blocking::RequestBuilder, url: &Url) -> reqwest::blocking::RequestBuilder {
+        match &self.cfg.bot_auth {
+            Some(auth) => auth.headers(url).into_iter().fold(builder, |b, (k, v)| b.header(k, v)),
+            None => builder,
+        }
     }
 
     /// Hosts on the blocklist (built-in list plus config).
@@ -320,7 +334,7 @@ impl Net {
     fn load_robots(&self, url: &Url) -> Robots {
         let Ok(mut u) = url.join("/robots.txt") else { return Robots::allow_all() };
         for _ in 0..4 {
-            let Ok(resp) = self.client.get(u.clone()).timeout(Duration::from_secs(8)).send() else {
+            let Ok(resp) = self.sign(self.client.get(u.clone()), &u).timeout(Duration::from_secs(8)).send() else {
                 return Robots::allow_all();
             };
             let status = resp.status();

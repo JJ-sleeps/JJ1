@@ -27,6 +27,7 @@ serde_json.workspace = true
 url.workspace = true
 jj1-net.workspace = true
 jj1-distill.workspace = true
+jj1-core.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 base64 = "0.22"
 

@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 /// Actions that can be put on the confirm list.
 pub const CONFIRMABLE: &[&str] = &["submit", "submit_get", "cross_origin"];
 
+/// File holding this install's Web Bot Auth signing key (a 32-byte seed).
+pub fn bot_key_path() -> PathBuf {
+    config_dir().join("bot-auth.ed25519")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -38,7 +43,25 @@ pub struct Config {
     pub persistent_profile: bool,
     /// How long a WebView page may take to load and settle.
     pub webview_timeout_secs: u64,
+    /// Hold any request that would carry a value one site showed the agent
+    /// (an email, account number, token...) to a different site, until the
+    /// user confirms.
+    pub data_guard: bool,
     pub policy: PolicyConfig,
+    pub bot_auth: BotAuthConfig,
+}
+
+/// Signed requests (Web Bot Auth), so sites can verify that a request really
+/// comes from JJ1 and not from something pretending to be it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct BotAuthConfig {
+    /// Sign every request with this install's Ed25519 key (`jj1 identity`).
+    pub enabled: bool,
+    /// Where your key directory is published, e.g. "https://you.example".
+    /// Sent as `Signature-Agent`; sites fetch
+    /// `<this>/.well-known/http-message-signatures-directory` to verify.
+    pub signature_agent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +94,9 @@ impl Default for Config {
             js_escalation: true,
             persistent_profile: false,
             webview_timeout_secs: 30,
+            data_guard: true,
             policy: PolicyConfig::default(),
+            bot_auth: BotAuthConfig::default(),
         }
     }
 }
