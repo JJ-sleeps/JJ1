@@ -3,6 +3,7 @@
 
 pub mod browserdata;
 pub mod deuri;
+pub mod devtools;
 pub mod extensions;
 pub mod screenshot;
 

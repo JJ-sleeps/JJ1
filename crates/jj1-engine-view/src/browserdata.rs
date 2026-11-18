@@ -41,6 +41,8 @@ pub struct Settings {
     pub homepage: String,
     pub block_trackers: bool,
     pub save_history: bool,
+    /// "light" or "dark".
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -50,6 +52,7 @@ impl Default for Settings {
             homepage: "beach".into(),
             block_trackers: true,
             save_history: true,
+            theme: "light".into(),
         }
     }
 }
@@ -80,8 +83,15 @@ impl Settings {
             }
             s.block_trackers = v["block_trackers"].as_bool().unwrap_or(s.block_trackers);
             s.save_history = v["save_history"].as_bool().unwrap_or(s.save_history);
+            if let Some(t) = v["theme"].as_str() {
+                s.theme = if t == "dark" { "dark".into() } else { "light".into() };
+            }
         }
         s
+    }
+
+    pub fn is_dark(&self) -> bool {
+        self.theme == "dark"
     }
 
     pub fn save(&self, dir: &Path) {
@@ -94,6 +104,7 @@ impl Settings {
             "homepage": self.homepage,
             "block_trackers": self.block_trackers,
             "save_history": self.save_history,
+            "theme": self.theme,
         })
     }
 
