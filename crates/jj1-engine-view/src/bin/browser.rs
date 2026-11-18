@@ -1819,11 +1819,45 @@ fn start_turn(
     });
 }
 
+/// Save the Deuri chat that is open, so closing mid-conversation keeps it.
+fn save_open_chat(chat_id: &Option<String>, history: &Mutex<Vec<Value>>) {
+    if let Some(id) = chat_id {
+        let h = history.lock().unwrap_or_else(|e| e.into_inner());
+        if !h.is_empty() {
+            browserdata::save_chat(&config_dir(), id, &h);
+        }
+    }
+}
+
 fn shut_down(stop: &AtomicBool, used: &Option<deuri::Settings>) {
     stop.store(true, Ordering::Relaxed);
     if let Some(s) = used.as_ref().filter(|s| s.unload_on_exit) {
         deuri::unload_in_background(s);
     }
+}
+
+/// Close this window's process now.
+///
+/// Letting the event loop exit normally first tears down every WebView and
+/// the window, and only then ends the process. If a WebView's close call
+/// stalls (for example while the WebView2 runtime that several JJ1 windows
+/// share is busy), the window has already vanished but the process stays
+/// behind with no window, holding its files. Everything JJ1 keeps (settings,
+/// history, chats) is written as it happens, and cookies and site data belong
+/// to the WebView2 runtime, which saves them itself, so ending the process
+/// directly loses nothing.
+fn quit(window: &Window, stop: &AtomicBool, used: &Option<deuri::Settings>) -> ! {
+    shut_down(stop, used);
+    window.set_visible(false);
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        // SAFETY: ends this process; nothing runs after it.
+        unsafe {
+            let _ = TerminateProcess(GetCurrentProcess(), 0);
+        }
+    }
+    std::process::exit(0)
 }
 
 fn spawn_new_window() {
@@ -1982,8 +2016,8 @@ fn main() {
         let mut queue: Vec<Value> = Vec::new();
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-                shut_down(&stop, &used_settings);
-                *control_flow = ControlFlow::Exit;
+                save_open_chat(&chat_id, &history);
+                quit(&window, &stop, &used_settings);
             }
             Event::WindowEvent { event: WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }, .. } => {
                 relayout(&window, &toolbar, &tabs, panel.as_ref(), panel_open);
@@ -2530,9 +2564,8 @@ fn main() {
                     if let Some(pos) = tabs.iter().position(|t| t.id == id) {
                         tabs.remove(pos);
                         if tabs.is_empty() {
-                            shut_down(&stop, &used_settings);
-                            *control_flow = ControlFlow::Exit;
-                            return;
+                            save_open_chat(&chat_id, &history);
+                            quit(&window, &stop, &used_settings);
                         }
                         if active == id {
                             active = tabs[pos.min(tabs.len() - 1)].id;
