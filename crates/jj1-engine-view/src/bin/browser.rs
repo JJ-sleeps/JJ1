@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use jj1_distill::{est_tokens, Options, Scope};
-use jj1_engine_view::{deuri, extensions, install_request_filter, screenshot};
+use jj1_engine_view::{browserdata, deuri, extensions, install_request_filter, screenshot};
 use jj1_net::{host_matches, points_to_private_network, DEFAULT_BLOCKLIST};
 use serde_json::{json, Value};
 use tao::dpi::LogicalSize;
@@ -40,6 +40,8 @@ const SEARCH_URL: &str = "https://duckduckgo.com/?q=";
 const DEURI_SEARCH_URL: &str = "https://html.duckduckgo.com/html/?q=";
 const AGENT_VIEW_URL: &str = "jj1://agent-view";
 const EXT_URL: &str = "jj1://extensions";
+const HISTORY_URL: &str = "jj1://history";
+const SETTINGS_URL: &str = "jj1://settings";
 const START_URL: &str = "jj1://start";
 const OUTER_HTML: &str = "document.documentElement.outerHTML";
 const PART_CHARS: usize = 20_000;
@@ -55,8 +57,8 @@ fn beach_data_url() -> String {
 const TOOLBAR_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8"><style>
 /* Always the light "frosted glass" chrome, whatever the system theme. */
 :root{color-scheme:light;
-  --chrome:rgba(250,251,253,.66);--fg:#222733;--mut:#5c6675;--line:rgba(120,130,150,.26);
-  --acc:#2f6fed;--field:rgba(255,255,255,.78);--active:rgba(255,255,255,.96);--hover:rgba(110,125,150,.14)}
+  --chrome:rgba(249,250,253,.52);--fg:#222733;--mut:#5c6675;--line:rgba(120,130,150,.24);
+  --acc:#2f6fed;--field:rgba(255,255,255,.62);--active:rgba(255,255,255,.82);--hover:rgba(110,125,150,.16)}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,"Segoe UI",sans-serif;color:var(--fg);user-select:none;
   background:var(--chrome);backdrop-filter:blur(34px) saturate(170%);-webkit-backdrop-filter:blur(34px) saturate(170%)}
@@ -77,13 +79,14 @@ html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,"Segoe UI",sa
 .nav,.pill{border:0;background:none;color:var(--fg);cursor:pointer;font:inherit}
 .nav{width:34px;height:34px;border-radius:50%;font-size:17px}
 .nav:disabled{opacity:.3;cursor:default}
-.nav:hover:enabled,.pill:hover,#icon:hover{background:var(--hover)}
+.nav:hover:enabled,.pill:hover,#icon:hover,.tbtn:hover{background:var(--hover)}
 #url{flex:1;height:34px;margin:0 6px;border:1px solid var(--line);border-radius:18px;padding:0 16px;font:inherit;
   background:var(--field);color:var(--fg);outline:none;user-select:text;box-shadow:inset 0 1px 2px rgba(0,0,0,.04)}
 #url:focus{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
-#icon{width:34px;height:34px;border:0;background:none;color:var(--fg);border-radius:50%;cursor:pointer;font-size:16px}
+#icon,.tbtn{width:34px;height:34px;border:0;background:none;color:var(--fg);border-radius:50%;cursor:pointer;font-size:18px;flex:none}
 .pill{height:34px;border:1px solid var(--line);border-radius:18px;padding:0 15px;white-space:nowrap}
 #deuri.on,#deuri.on:hover{background:var(--acc);border-color:var(--acc);color:#fff}
+#tools{display:flex;gap:1px;margin:0 2px}
 </style></head><body>
 <div id="tabs"></div>
 <div id="bar">
@@ -91,10 +94,13 @@ html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,"Segoe UI",sa
   <button class="nav" id="fwd" title="Forward (Alt+Right)">&#8594;</button>
   <button class="nav" id="reload" title="Reload (Ctrl+R)">&#8635;</button>
   <input id="url" spellcheck="false" autocomplete="off" placeholder="Search or enter address">
-  <button id="icon" title="New window (Ctrl+N)">&#9638;</button>
-  <button id="icon" title="Extensions" onclick="send({c:'extensions'})">&#129513;</button>
   <button class="pill" id="deuri" title="Chat with Deuri, the local assistant (Ctrl+J)">Deuri</button>
   <button class="pill" id="agent" title="What an AI agent receives for this page">Agent view</button>
+  <span id="tools">
+    <button class="tbtn" data-c="history" title="History">&#128339;</button>
+    <button class="tbtn" data-c="extensions" title="Extensions">&#129513;</button>
+    <button class="tbtn" data-c="settings" title="Settings">&#9881;</button>
+  </span>
 </div>
 <script>
 var GLOBE="url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22black%22><path d=%22M12 2a10 10 0 100 20 10 10 0 000-20zm6.9 6h-2.5a15 15 0 00-1.1-3.3A8 8 0 0118.9 8zM12 4c.8 0 1.9 1.6 2.4 4H9.6C10.1 5.6 11.2 4 12 4zM4.3 14a8 8 0 010-4h2.9a16 16 0 000 4zm.8 2h2.5a15 15 0 001.1 3.3A8 8 0 015.1 16zM9.6 16h4.8C13.9 18.4 12.8 20 12 20s-1.9-1.6-2.4-4zm.9-2a14 14 0 010-4h3a14 14 0 010 4zm5.3 5.3a15 15 0 001.1-3.3h2.5a8 8 0 01-3.6 3.3zM16.8 14a16 16 0 000-4h2.9a8 8 0 010 4z%22/></svg>')";
@@ -133,7 +139,7 @@ document.getElementById('fwd').onclick = function(){ send({c:'fwd'}); };
 document.getElementById('reload').onclick = function(){ send({c:'reload'}); };
 document.getElementById('deuri').onclick = function(){ send({c:'deuri'}); };
 document.getElementById('agent').onclick = function(){ send({c:'agent'}); };
-document.querySelectorAll('#icon')[0].onclick = function(){ send({c:'newwindow'}); };
+document.querySelectorAll('#tools button').forEach(function(b){ b.onclick = function(){ send({c:b.getAttribute('data-c')}); }; });
 window.addEventListener('keydown', function(e){
   if ((e.ctrlKey || e.metaKey) && !e.altKey) {
     var k = e.key.toLowerCase();
@@ -176,24 +182,40 @@ const PAGE_BOOTSTRAP: &str = r#"(function(){
 "#;
 
 const DEURI_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8"><style>
-:root{color-scheme:light;--bg:rgba(250,251,253,.64);--fg:#222733;--mut:#5c6675;--line:rgba(120,130,150,.26);
-  --acc:#2f6fed;--me:#2f6fed;--bot:rgba(255,255,255,.78);--code:rgba(110,125,150,.14)}
+:root{color-scheme:light;--bg:rgba(249,250,253,.5);--fg:#222733;--mut:#5c6675;--line:rgba(120,130,150,.24);
+  --acc:#2f6fed;--me:#2f6fed;--bot:rgba(255,255,255,.55);--code:rgba(110,125,150,.16)}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;font:14px/1.5 system-ui,"Segoe UI",sans-serif;color:var(--fg)}
 body{display:flex;flex-direction:column;background:var(--bg);
-  backdrop-filter:blur(36px) saturate(170%);-webkit-backdrop-filter:blur(36px) saturate(170%);border-left:1px solid var(--line)}
-header{display:flex;align-items:center;gap:8px;padding:11px 13px;border-bottom:1px solid var(--line)}
-header b{font-size:15px}
-#model{flex:1;min-width:0;color:var(--mut);font-size:12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-header button{border:1px solid var(--line);background:none;color:var(--fg);border-radius:14px;padding:3px 11px;font:inherit;font-size:12px;cursor:pointer}
-header button:hover{background:rgba(127,127,127,.16)}
-#log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:11px}
-.msg{position:relative;max-width:94%;padding:9px 13px;border-radius:14px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}
+  backdrop-filter:blur(40px) saturate(180%);-webkit-backdrop-filter:blur(40px) saturate(180%);border-left:1px solid var(--line)}
+header{display:flex;align-items:center;gap:7px;padding:12px 14px;border-bottom:1px solid var(--line)}
+header b{font-size:15px;letter-spacing:.01em}
+#model{flex:1;min-width:0;color:var(--mut);font-size:11.5px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.hbtn{border:1px solid var(--line);background:rgba(255,255,255,.4);color:var(--fg);border-radius:16px;padding:5px 11px;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}
+.hbtn:hover{background:rgba(255,255,255,.75)}
+#wrap{position:relative;flex:1;min-height:0;display:flex}
+#log{flex:1;overflow-y:auto;padding:16px 14px;display:flex;flex-direction:column;gap:12px}
+.overlay{position:absolute;inset:0;background:var(--bg);backdrop-filter:blur(40px) saturate(180%);-webkit-backdrop-filter:blur(40px) saturate(180%);display:none;flex-direction:column}
+.overlay.on{display:flex}
+.ohead{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);font-size:14px}
+.ohead button{border:0;background:none;font-size:20px;line-height:1;color:var(--mut);cursor:pointer}
+#chatlist{flex:1;overflow-y:auto;padding:8px}
+.chat{display:flex;align-items:center;gap:8px;padding:11px 12px;border-radius:12px;cursor:pointer}
+.chat:hover{background:rgba(255,255,255,.55)}
+.chat .ct{flex:1;min-width:0}
+.chat .cti{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat .cd{color:var(--mut);font-size:11.5px}
+.chat.cur .cti{color:var(--acc)}
+.chat .cx{border:0;background:none;color:var(--mut);font-size:16px;cursor:pointer;opacity:.5;border-radius:50%;width:26px;height:26px;flex:none}
+.chat .cx:hover{opacity:1;background:rgba(192,69,58,.14);color:#c0453a}
+.oempty{color:var(--mut);text-align:center;padding:40px 16px}
+.msg{position:relative;max-width:92%;padding:10px 14px;border-radius:17px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;animation:pop .14s ease}
+@keyframes pop{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .del{position:absolute;top:-8px;right:-7px;width:22px;height:22px;border:0;border-radius:50%;background:rgba(44,48,56,.8);color:#fff;font-size:13px;line-height:22px;text-align:center;cursor:pointer;padding:0;opacity:.45;transition:opacity .12s,background .12s;box-shadow:0 2px 8px rgba(0,0,0,.3)}
 .msg:hover .del{opacity:1}
 .del:hover{opacity:1;background:#c0453a}
-.me{align-self:flex-end;background:var(--me);color:#fff;border-bottom-right-radius:5px;box-shadow:0 2px 12px color-mix(in srgb,var(--me) 40%,transparent)}
-.bot{align-self:flex-start;background:var(--bot);border-bottom-left-radius:5px;box-shadow:0 2px 12px rgba(30,40,60,.08)}
+.me{align-self:flex-end;background:linear-gradient(135deg,#3b78f0,#2f6fed);color:#fff;border-bottom-right-radius:6px;box-shadow:0 4px 14px color-mix(in srgb,var(--me) 42%,transparent)}
+.bot{align-self:flex-start;background:var(--bot);border:1px solid rgba(255,255,255,.65);border-bottom-left-radius:6px;box-shadow:0 4px 16px rgba(30,40,60,.09);backdrop-filter:blur(8px)}
 .err{border:1px solid #d9534f}
 .step{align-self:flex-start;color:var(--mut);font-size:12px;padding:0 4px}
 .bot pre{background:var(--code);padding:9px;border-radius:8px;overflow-x:auto;white-space:pre;margin:6px 0}
@@ -210,8 +232,13 @@ textarea:focus{border-color:var(--acc)}
 #send.stop{background:#c0453a}
 #use{margin-top:6px;color:var(--mut);font-size:11px;display:flex;justify-content:space-between;gap:8px}
 </style></head><body>
-<header><b>Deuri</b><span id="model">local model</span><button id="new" title="Start a new conversation">New chat</button></header>
+<header><b>Deuri</b><span id="model">local model</span>
+<button class="hbtn" id="hist" title="Past chats">&#128339;</button>
+<button class="hbtn" id="new" title="Start a new conversation">+&nbsp;New</button></header>
+<div id="wrap">
 <div id="log"><div id="empty">Ask about the page you are on, or ask Deuri to look something up.<br><br>The model runs on this computer. It loads when you send your first message and unloads itself after a while idle.</div></div>
+<div id="chats" class="overlay"><div class="ohead"><b>Past chats</b><button id="ochx" title="Close">&times;</button></div><div id="chatlist"></div></div>
+</div>
 <div id="status"></div>
 <footer><div id="row"><textarea id="box" placeholder="Message Deuri"></textarea><button id="send">Send</button></div>
 <div id="use"><span id="ctx"></span><span>Enter to send &middot; Shift+Enter new line</span></div></footer>
@@ -244,7 +271,7 @@ function add(cls,html){
   var d=document.createElement('div');d.className=cls;
   var c=document.createElement('div');c.className='c';c.innerHTML=html;d.appendChild(c);
   if(/\bhx\b/.test(cls)){
-    var del=document.createElement('button');del.className='del';del.textContent='×';del.title='Delete this exchange and free its tokens';
+    var del=document.createElement('button');del.className='del';del.textContent='×';del.title='Delete this message and free its tokens';
     del.onclick=function(ev){ev.stopPropagation();if(busy)return;var i=delIndex(d);if(i>=0)post({c:'delete',i:i});};
     d.appendChild(del);
   }
@@ -267,14 +294,31 @@ window.deuriEvent=function(e){
   else if(e.t==='done'){setBusy(false); st.textContent=''; if(!answered)add('msg bot','<i>(no answer)</i>'); cur=null; if(e.used>0)ctx.textContent='Context used: ~'+k(e.used)+' of '+k(e.ctx)+' tokens';}
   else if(e.t==='error'){setBusy(false); st.textContent=''; cur=null; add('msg bot err',esc(e.v));}
   else if(e.t==='history'){ cur=null; log.innerHTML=''; if(e.msgs&&e.msgs.length){ e.msgs.forEach(function(m){ add(m.role==='me'?'msg me hx':'msg bot hx', m.role==='me'?esc(m.text):render(m.text)); }); } else { log.innerHTML=EMPTY; } ctx.textContent=(e.used>0)?('Context used: ~'+k(e.used)+' of '+k(e.ctx)+' tokens'):''; }
+  else if(e.t==='chats'){ showChats(e.list||[], e.current); }
 };
+function when(ts){var d=new Date(ts*1000),s=Math.floor(Date.now()/1000)-ts; if(s<86400)return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); return d.toLocaleDateString();}
+function showChats(list,current){
+  var box2=document.getElementById('chatlist'); box2.textContent='';
+  if(!list.length){ box2.innerHTML='<div class=oempty>No saved chats yet.</div>'; return; }
+  list.forEach(function(c){
+    var r=document.createElement('div'); r.className='chat'+(c.id===current?' cur':'');
+    var t=document.createElement('div'); t.className='ct'; t.innerHTML='<div class=cti>'+esc(c.title||'Chat')+'</div><div class=cd>'+when(c.updated)+'</div>';
+    t.onclick=function(){ post({c:'loadchat',id:c.id}); closeChats(); };
+    var x=document.createElement('button'); x.className='cx'; x.textContent='×'; x.title='Delete chat';
+    x.onclick=function(ev){ ev.stopPropagation(); post({c:'delchat',id:c.id}); };
+    r.appendChild(t); r.appendChild(x); box2.appendChild(r);
+  });
+}
+function closeChats(){ document.getElementById('chats').classList.remove('on'); }
+document.getElementById('hist').onclick=function(){ document.getElementById('chats').classList.add('on'); post({c:'chats'}); };
+document.getElementById('ochx').onclick=closeChats;
 window.setModel=function(m){document.getElementById('model').textContent=m;};
 window.focusBox=function(){box.focus();};
 window.ask=function(q){box.value=q;submit();};
 box.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();submit();}});
 box.addEventListener('input',grow);
 btn.onclick=submit;
-document.getElementById('new').onclick=function(){if(busy)return;post({c:'reset'});log.innerHTML=EMPTY;ctx.textContent='';cur=null;box.focus();};
+document.getElementById('new').onclick=function(){if(busy)return;post({c:'reset'});log.innerHTML=EMPTY;ctx.textContent='';cur=null;closeChats();box.focus();};
 log.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[data-u]');if(a){e.preventDefault();post({c:'open',v:a.getAttribute('data-u')});}});
 window.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&!e.altKey&&e.key.toLowerCase()==='j'){e.preventDefault();post({c:'toggle'});}});
 post({c:'ready'});
@@ -329,6 +373,8 @@ enum Msg {
     Favicon { tab: usize, data: String },
     Navigate { tab: usize, input: String },
     Ext { body: String },
+    /// A control message from a built-in page (history, settings).
+    Cfg { body: String },
     Popup(String),
     AgentHtml { tab: usize, json: String },
     Panel(String),
@@ -381,7 +427,7 @@ fn search_url(base: &str, query: &str) -> String {
     format!("{base}{q}")
 }
 
-fn resolve_input(text: &str) -> Option<String> {
+fn resolve_input(text: &str, search: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -398,7 +444,7 @@ fn resolve_input(text: &str) -> Option<String> {
         let local = host_part.starts_with("localhost") || host_part.starts_with("127.") || host_part.starts_with('[');
         return Some(format!("{}://{text}", if local { "http" } else { "https" }));
     }
-    Some(search_url(SEARCH_URL, text))
+    Some(search_url(search, text))
 }
 
 fn esc(s: &str) -> String {
@@ -614,6 +660,171 @@ pre{{white-space:pre-wrap;word-break:break-word;background:color-mix(in srgb,Can
     )
 }
 
+/// JSON safe to embed inside a `<script>` tag.
+fn embed(v: &Value) -> String {
+    v.to_string().replace("</", "<\\/")
+}
+
+const BUILTIN_STYLE: &str = r##"<style>
+:root{color-scheme:light}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.55 system-ui,"Segoe UI",sans-serif;color:#222733;
+  background:linear-gradient(160deg,#eef1f6,#e6eaf1)}
+main{max-width:52em;margin:0 auto;padding:34px 22px 80px}
+h1{font-size:1.7em;margin:0 0 4px;letter-spacing:.01em} h2{font-size:1.05em;margin:26px 0 10px;color:#3a4150}
+.m{color:#5c6675}
+a{color:#2f6fed;text-decoration:none} a:hover{text-decoration:underline}
+.card{background:rgba(255,255,255,.72);border:1px solid rgba(120,130,150,.22);border-radius:14px;
+  padding:6px;margin:14px 0;backdrop-filter:blur(8px);box-shadow:0 6px 22px rgba(40,50,70,.06)}
+.row{display:flex;align-items:center;gap:12px;padding:9px 12px;border-radius:10px;cursor:pointer}
+.row:hover{background:rgba(120,130,150,.12)}
+.row .t{flex:1;min-width:0} .row .tt{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .uu{color:#5c6675;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .ti{color:#8892a3;font-size:12px;flex:none}
+.sep{padding:14px 12px 4px;color:#8892a3;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+input[type=text],input[type=number],select{width:100%;height:38px;border:1px solid rgba(120,130,150,.3);border-radius:10px;
+  padding:0 12px;font:inherit;background:#fff;color:#222733;outline:none}
+input:focus,select:focus{border-color:#2f6fed}
+.field{margin:14px 0} .field label{display:block;font-weight:500;margin-bottom:6px}
+.field .h{font-weight:400;color:#8892a3;font-size:12.5px;margin-top:3px}
+.set{background:rgba(255,255,255,.72);border:1px solid rgba(120,130,150,.22);border-radius:14px;padding:16px 18px;margin:12px 0;backdrop-filter:blur(8px)}
+.toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0}
+.toggle:not(:last-child){border-bottom:1px solid rgba(120,130,150,.16)}
+.sw{position:relative;width:44px;height:25px;flex:none}
+.sw input{opacity:0;width:0;height:0;position:absolute}
+.sl{position:absolute;inset:0;background:#c4ccd8;border-radius:25px;transition:.15s;cursor:pointer}
+.sl:before{content:"";position:absolute;width:19px;height:19px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+.sw input:checked+.sl{background:#2f6fed} .sw input:checked+.sl:before{transform:translateX(19px)}
+button.btn{height:38px;padding:0 18px;border:0;border-radius:10px;background:#2f6fed;color:#fff;font:inherit;font-weight:500;cursor:pointer}
+button.btn:hover{background:#2560d8}
+button.ghost{background:#fff;color:#222733;border:1px solid rgba(120,130,150,.3)}
+button.ghost:hover{background:#f4f6fa}
+button.danger{background:#fff;color:#c0453a;border:1px solid #d8a6a0}
+button.danger:hover{background:#fdeceb}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+.top{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+.top h1{margin:0}
+#search{flex:1}
+.empty{color:#8892a3;text-align:center;padding:50px 0}
+.saved{color:#2e9e5b;font-size:13px;margin-left:8px;opacity:0;transition:opacity .2s}
+.saved.on{opacity:1}
+</style>"##;
+
+/// The browsing-history page: a searchable list of visited pages.
+fn history_page(dir: &std::path::Path) -> String {
+    let visits = browserdata::load_history(dir);
+    format!(
+        r##"<!doctype html><html><head><meta charset="utf-8"><title>History</title>{style}</head><body><main>
+<div class="top"><h1>History</h1><input id="search" type="text" placeholder="Search history"><button class="btn danger" id="clear">Clear all</button></div>
+<div id="list" class="card"></div>
+<script>
+var VISITS={visits};
+function send(m){{window.ipc&&window.ipc.postMessage(m);}}
+function esc(s){{return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+function ago(ts){{var s=Math.floor(Date.now()/1000)-ts; if(s<60)return'just now'; if(s<3600)return Math.floor(s/60)+'m ago'; if(s<86400)return Math.floor(s/3600)+'h ago'; var d=new Date(ts*1000); return d.toLocaleDateString();}}
+function host(u){{try{{return new URL(u).host;}}catch(e){{return u;}}}}
+function render(q){{
+  q=(q||'').toLowerCase();
+  var list=document.getElementById('list'); list.textContent='';
+  var shown=VISITS.filter(function(v){{return !q||(v.title||'').toLowerCase().indexOf(q)>=0||(v.url||'').toLowerCase().indexOf(q)>=0;}});
+  if(!shown.length){{list.innerHTML='<div class=empty>'+(VISITS.length?'No matches.':'No history yet.')+'</div>';return;}}
+  shown.forEach(function(v){{
+    var r=document.createElement('div'); r.className='row';
+    r.innerHTML='<div class=t><div class=tt>'+esc(v.title||host(v.url))+'</div><div class=uu>'+esc(v.url)+'</div></div><div class=ti>'+ago(v.ts)+'</div>';
+    r.onclick=function(){{send('nav:'+v.url);}};
+    list.appendChild(r);
+  }});
+}}
+document.getElementById('search').addEventListener('input',function(e){{render(e.target.value);}});
+document.getElementById('clear').onclick=function(){{if(confirm('Clear all browsing history?')){{send('cfg:clear-history');VISITS=[];render('');}}}};
+render('');
+</script></main></body></html>"##,
+        style = BUILTIN_STYLE,
+        visits = embed(&json!(visits)),
+    )
+}
+
+/// The settings page: browser preferences plus Deuri's model config.
+fn settings_page(bs: &browserdata::Settings, ds: &deuri::Settings) -> String {
+    let dj = json!({
+        "model": ds.model, "context_length": ds.context_length, "gpu_offload_ratio": ds.gpu_offload_ratio,
+        "kv_cache_quant": ds.kv_cache_quant, "flash_attention": ds.flash_attention,
+        "idle_unload_secs": ds.idle_unload_secs, "max_reply_tokens": ds.max_reply_tokens,
+    });
+    format!(
+        r##"<!doctype html><html><head><meta charset="utf-8"><title>Settings</title>{style}</head><body><main>
+<div class="top"><h1>Settings</h1><span id="saved" class="saved">Saved</span></div>
+
+<h2>Search &amp; start</h2>
+<div class="set">
+  <div class="field"><label>Search engine</label>
+    <select id="engine"><option value="duckduckgo">DuckDuckGo</option><option value="google">Google</option><option value="bing">Bing</option><option value="brave">Brave</option></select></div>
+  <div class="field"><label>Homepage / new tab</label>
+    <select id="homekind"><option value="beach">Deuri's world (beach)</option><option value="blank">Blank page</option><option value="url">A web address&hellip;</option></select>
+    <div id="homeurlwrap" style="margin-top:8px;display:none"><input id="homeurl" type="text" placeholder="https://example.com"></div></div>
+</div>
+
+<h2>Privacy</h2>
+<div class="set">
+  <div class="toggle"><div><b>Block trackers &amp; ads</b><div class="m">Stop known tracker and ad hosts from loading.</div></div>
+    <label class="sw"><input type="checkbox" id="block"><span class="sl"></span></label></div>
+  <div class="toggle"><div><b>Save browsing history</b><div class="m">Keep a list of pages you visit, on this computer only.</div></div>
+    <label class="sw"><input type="checkbox" id="savehist"><span class="sl"></span></label></div>
+  <div class="actions" style="margin-top:14px">
+    <button class="btn ghost" id="clearhist">Clear browsing history</button>
+    <button class="btn danger" id="cleardata">Clear cookies &amp; site data</button></div>
+</div>
+
+<h2>Deuri (local assistant)</h2>
+<div class="set">
+  <div class="field"><label>Model (LM Studio key)</label><input id="d_model" type="text"></div>
+  <div class="field"><label>Context length (tokens)</label><input id="d_ctx" type="number" min="4096" step="1000">
+    <div class="h">How much conversation the model keeps in mind.</div></div>
+  <div class="field"><label>GPU offload ratio (0&ndash;1)</label><input id="d_gpu" type="number" min="0" max="1" step="0.015625">
+    <div class="h">Fraction of layers on the GPU. 0.703125 = 45 of Bonsai 2's 64 layers.</div></div>
+  <div class="field"><label>K/V cache quantization</label>
+    <select id="d_cache"><option value="q8_0">q8_0 (recommended)</option><option value="q4_0">q4_0 (smallest)</option><option value="f16">Off (f16)</option></select>
+    <div class="h">Shrinks the memory a long context needs. Needs flash attention.</div></div>
+  <div class="toggle"><div><b>Flash attention</b></div><label class="sw"><input type="checkbox" id="d_fa"><span class="sl"></span></label></div>
+  <div class="field" style="margin-top:14px"><label>Unload the model after idle (seconds)</label><input id="d_idle" type="number" min="30" step="30"></div>
+  <div class="field"><label>Max reply tokens</label><input id="d_reply" type="number" min="256" step="100">
+    <div class="h">Includes the model's hidden reasoning.</div></div>
+  <div class="h">Changes apply the next time Deuri loads the model.</div>
+</div>
+
+<div class="actions"><button class="btn" id="save">Save settings</button></div>
+
+<script>
+var BS={bs}, DS={ds};
+function send(m){{window.ipc&&window.ipc.postMessage(m);}}
+function val(id){{return document.getElementById(id);}}
+// init
+val('engine').value=BS.search_engine;
+var hk=BS.homepage==='beach'||BS.homepage==='blank'?BS.homepage:'url';
+val('homekind').value=hk; if(hk==='url'){{val('homeurlwrap').style.display='block'; val('homeurl').value=BS.homepage;}}
+val('block').checked=!!BS.block_trackers; val('savehist').checked=!!BS.save_history;
+val('d_model').value=DS.model; val('d_ctx').value=DS.context_length; val('d_gpu').value=DS.gpu_offload_ratio;
+val('d_cache').value=DS.kv_cache_quant||'f16'; val('d_fa').checked=!!DS.flash_attention;
+val('d_idle').value=DS.idle_unload_secs; val('d_reply').value=DS.max_reply_tokens;
+val('homekind').onchange=function(){{val('homeurlwrap').style.display=this.value==='url'?'block':'none';}};
+function flash(){{var s=val('saved');s.classList.add('on');setTimeout(function(){{s.classList.remove('on');}},1600);}}
+val('save').onclick=function(){{
+  var home=val('homekind').value==='url'?(val('homeurl').value.trim()||'beach'):val('homekind').value;
+  var bs={{search_engine:val('engine').value,homepage:home,block_trackers:val('block').checked,save_history:val('savehist').checked}};
+  var ds={{model:val('d_model').value.trim(),context_length:parseInt(val('d_ctx').value)||100000,gpu_offload_ratio:parseFloat(val('d_gpu').value)||0.7,kv_cache_quant:val('d_cache').value,flash_attention:val('d_fa').checked,idle_unload_secs:parseInt(val('d_idle').value)||600,max_reply_tokens:parseInt(val('d_reply').value)||3000}};
+  send('cfg:save-settings:'+JSON.stringify(bs));
+  send('cfg:save-deuri:'+JSON.stringify(ds));
+  flash();
+}};
+val('clearhist').onclick=function(){{if(confirm('Clear all browsing history?'))send('cfg:clear-history');}};
+val('cleardata').onclick=function(){{if(confirm('Clear all cookies and site data? You will be signed out of sites.'))send('cfg:clear-data');}};
+</script></main></body></html>"##,
+        style = BUILTIN_STYLE,
+        bs = embed(&bs.to_json()),
+        ds = embed(&dj),
+    )
+}
+
 fn logical_size(window: &Window) -> (f64, f64) {
     let s = window.inner_size().to_logical::<f64>(window.scale_factor());
     (s.width, s.height)
@@ -684,11 +895,13 @@ fn light_title_bar(window: &Window) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_tab(
     window: &Window,
     context: &mut WebContext,
     proxy: &EventLoopProxy<Msg>,
     blocked: &[String],
+    block_trackers: &Arc<AtomicBool>,
     page_init: &str,
     id: usize,
     start: Start,
@@ -718,6 +931,8 @@ fn open_tab(
                 let _ = ipc_proxy.send_event(Msg::Navigate { tab: id, input: n.to_string() });
             } else if body.starts_with("ext:") {
                 let _ = ipc_proxy.send_event(Msg::Ext { body: body.clone() });
+            } else if let Some(c) = body.strip_prefix("cfg:") {
+                let _ = ipc_proxy.send_event(Msg::Cfg { body: c.to_string() });
             }
         });
     let (url, label) = match start {
@@ -733,11 +948,13 @@ fn open_tab(
     let view = builder.build_as_child(window).map_err(|e| e.to_string())?;
 
     let blocked = blocked.to_vec();
+    let toggle = block_trackers.clone();
     if let Err(e) = install_request_filter(&view, move |_kind, url| {
-        Url::parse(url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
-            .is_some_and(|host| blocked.iter().any(|b| host_matches(&host, b)))
+        toggle.load(Ordering::Relaxed)
+            && Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                .is_some_and(|host| blocked.iter().any(|b| host_matches(&host, b)))
     }) {
         eprintln!("jj1-browser: tracker blocking is off: {e}");
     }
@@ -786,7 +1003,7 @@ fn start_turn(
             let mut args = if args.is_object() { args.clone() } else { json!({}) };
             if name == "open_url" || name == "search_web" {
                 let target = if name == "open_url" {
-                    args["url"].as_str().and_then(resolve_input)
+                    args["url"].as_str().and_then(|u| resolve_input(u, SEARCH_URL))
                 } else {
                     args["query"].as_str().filter(|q| !q.trim().is_empty()).map(|q| search_url(DEURI_SEARCH_URL, q))
                 };
@@ -825,7 +1042,19 @@ fn spawn_new_window() {
     }
 }
 
+/// The start-of-a-new-tab content, per the homepage setting: the beach page,
+/// a blank page, or a configured URL.
+fn home_start(settings: &browserdata::Settings, start_html: &str) -> Start {
+    match settings.homepage.as_str() {
+        "blank" => Start::Html { html: "<!doctype html><title>New tab</title><body style='background:Canvas'></body>".into(), label: START_URL },
+        h if h.starts_with("http://") || h.starts_with("https://") => Start::Url(h.to_string()),
+        _ => Start::Html { html: start_html.to_string(), label: START_URL },
+    }
+}
+
 fn main() {
+    let mut settings = browserdata::Settings::load(&config_dir());
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut auto_agent_view = false;
     let mut auto_ask: Option<String> = None;
@@ -838,13 +1067,14 @@ fn main() {
                 auto_ask = args.get(i + 1).cloned();
                 i += 1;
             }
-            a if !a.starts_with("--") && first.is_none() => first = resolve_input(a),
+            a if !a.starts_with("--") && first.is_none() => first = resolve_input(a, settings.search_base()),
             _ => {}
         }
         i += 1;
     }
     let first_is_page = first.is_some();
     let mut open_panel_on_load = auto_ask.is_some();
+    let block_trackers = Arc::new(AtomicBool::new(settings.block_trackers));
 
     // Extensions: load once; write the bundled sample on first run.
     extensions::ensure_samples(&config_dir());
@@ -904,12 +1134,14 @@ fn main() {
     let mut deuri_busy = false;
     let mut used_settings: Option<deuri::Settings> = None;
     let mut pending_read: Option<(usize, mpsc::Sender<String>)> = None;
+    // The current Deuri chat's saved id (assigned on the first message).
+    let mut chat_id: Option<String> = None;
 
     let start = match first {
         Some(u) => Start::Url(u),
-        None => Start::Html { html: start_html.clone(), label: START_URL },
+        None => home_start(&settings, &start_html),
     };
-    match open_tab(&window, &mut context, &proxy, &blocked, &page_init, next_id, start, content_bounds(&window, false)) {
+    match open_tab(&window, &mut context, &proxy, &blocked, &block_trackers, &page_init, next_id, start, content_bounds(&window, false)) {
         Ok(tab) => {
             active = tab.id;
             tabs.push(tab);
@@ -979,7 +1211,7 @@ fn main() {
                 sync(&tabs, active, false, panel_open);
             }
             Event::UserEvent(Msg::Navigate { tab, input }) => {
-                if let (Some(url), Some(t)) = (resolve_input(&input), tabs.iter_mut().find(|t| t.id == tab)) {
+                if let (Some(url), Some(t)) = (resolve_input(&input, settings.search_base()), tabs.iter_mut().find(|t| t.id == tab)) {
                     t.label = None;
                     t.url = url.clone();
                     t.loading = true;
@@ -1030,6 +1262,11 @@ fn main() {
                 }
                 sync(&tabs, active, true, panel_open);
                 if finished {
+                    if settings.save_history {
+                        if let Some(t) = tabs.iter().find(|t| t.id == tab && t.label.is_none()) {
+                            browserdata::record_visit(&config_dir(), &t.url, &t.title);
+                        }
+                    }
                     if pending_read.as_ref().is_some_and(|(id, _)| *id == tab) {
                         let p = proxy.clone();
                         std::thread::spawn(move || {
@@ -1064,6 +1301,11 @@ fn main() {
                 if let Some(t) = tabs.iter_mut().find(|t| t.id == tab) {
                     t.title = title;
                 }
+                if settings.save_history {
+                    if let Some(t) = tabs.iter().find(|t| t.id == tab && t.label.is_none() && !t.loading) {
+                        browserdata::record_visit(&config_dir(), &t.url, &t.title);
+                    }
+                }
                 sync(&tabs, active, false, panel_open);
             }
             Event::UserEvent(Msg::Popup(url)) => queue.push(json!({"c": "open", "v": url})),
@@ -1072,12 +1314,58 @@ fn main() {
                 let page_url = tabs.iter().find(|t| t.id == tab).map(|t| t.url.clone()).unwrap_or_default();
                 let page = agent_view_page(&page_url, &html);
                 let start = Start::Html { html: page, label: AGENT_VIEW_URL };
-                if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, &page_init, next_id, start, content_bounds(&window, panel_open)) {
+                if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, &block_trackers, &page_init, next_id, start, content_bounds(&window, panel_open)) {
                     active = t.id;
                     tabs.push(t);
                     next_id += 1;
                     show(&tabs, active);
                     sync(&tabs, active, true, panel_open);
+                }
+            }
+            Event::UserEvent(Msg::Cfg { body }) => {
+                if body == "clear-history" {
+                    browserdata::clear_history(&config_dir());
+                } else if body == "clear-data" {
+                    if let Some(t) = tabs.iter().find(|t| t.id == active) {
+                        let _ = t.view.clear_all_browsing_data();
+                    }
+                } else if let Some(j) = body.strip_prefix("save-settings:") {
+                    if let Ok(v) = serde_json::from_str::<Value>(j) {
+                        if let Some(e) = v["search_engine"].as_str() {
+                            settings.search_engine = e.to_string();
+                        }
+                        if let Some(h) = v["homepage"].as_str() {
+                            settings.homepage = h.to_string();
+                        }
+                        settings.block_trackers = v["block_trackers"].as_bool().unwrap_or(settings.block_trackers);
+                        settings.save_history = v["save_history"].as_bool().unwrap_or(settings.save_history);
+                        settings.save(&config_dir());
+                        block_trackers.store(settings.block_trackers, Ordering::Relaxed);
+                    }
+                } else if let Some(j) = body.strip_prefix("save-deuri:") {
+                    if let Ok(v) = serde_json::from_str::<Value>(j) {
+                        let mut ds = deuri::Settings::load(&config_dir());
+                        if let Some(m) = v["model"].as_str().filter(|m| !m.is_empty()) {
+                            ds.model = m.to_string();
+                        }
+                        if let Some(n) = v["context_length"].as_u64() {
+                            ds.context_length = (n as usize).max(4096);
+                        }
+                        if let Some(g) = v["gpu_offload_ratio"].as_f64() {
+                            ds.gpu_offload_ratio = g.clamp(0.0, 1.0);
+                        }
+                        if let Some(c) = v["kv_cache_quant"].as_str() {
+                            ds.kv_cache_quant = c.to_string();
+                        }
+                        ds.flash_attention = v["flash_attention"].as_bool().unwrap_or(ds.flash_attention);
+                        if let Some(i) = v["idle_unload_secs"].as_u64() {
+                            ds.idle_unload_secs = i.max(30);
+                        }
+                        if let Some(r) = v["max_reply_tokens"].as_u64() {
+                            ds.max_reply_tokens = r as usize;
+                        }
+                        ds.save(&config_dir());
+                    }
                 }
             }
             Event::UserEvent(Msg::Panel(body)) => {
@@ -1098,6 +1386,9 @@ fn main() {
                         if !deuri_busy && !text.is_empty() {
                             deuri_busy = true;
                             stop.store(false, Ordering::Relaxed);
+                            if chat_id.is_none() {
+                                chat_id = Some(browserdata::new_chat_id());
+                            }
                             let settings = deuri::Settings::load(&config_dir());
                             used_settings = Some(settings.clone());
                             start_turn(settings, history.clone(), stop.clone(), proxy.clone(), blocked.clone(), text);
@@ -1106,22 +1397,81 @@ fn main() {
                     "stop" => stop.store(true, Ordering::Relaxed),
                     "reset" => {
                         if !deuri_busy {
+                            // Save the chat being closed, then start fresh.
+                            if let Some(id) = &chat_id {
+                                let h = history.lock().unwrap_or_else(|e| e.into_inner());
+                                browserdata::save_chat(&config_dir(), id, &h);
+                            }
                             history.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                            chat_id = None;
                         }
                     }
                     "delete" => {
-                        // Remove one exchange from the conversation and tell the
-                        // panel the new transcript and token count.
+                        // Remove one message and tell the panel the new transcript.
                         if !deuri_busy {
                             let index = cmd["i"].as_u64().unwrap_or(u64::MAX) as usize;
                             let (msgs, used) = {
                                 let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
-                                let used = deuri::delete_exchange(&mut h, index);
+                                let used = deuri::delete_message(&mut h, index);
+                                if let Some(id) = &chat_id {
+                                    browserdata::save_chat(&config_dir(), id, &h);
+                                }
                                 (deuri::transcript(&h), used)
                             };
                             if let Some(p) = &panel {
                                 let ctx = deuri::Settings::load(&config_dir()).context_length;
                                 let v = json!({"t": "history", "msgs": msgs, "used": used, "ctx": ctx});
+                                let _ = p.evaluate_script(&format!("window.deuriEvent&&window.deuriEvent({v})"));
+                            }
+                        }
+                    }
+                    "chats" => {
+                        if let Some(p) = &panel {
+                            let list = browserdata::list_chats(&config_dir());
+                            let v = json!({"t": "chats", "list": list, "current": chat_id});
+                            let _ = p.evaluate_script(&format!("window.deuriEvent&&window.deuriEvent({v})"));
+                        }
+                    }
+                    "loadchat" => {
+                        if !deuri_busy {
+                            if let Some(id) = cmd["id"].as_str() {
+                                // Save the current chat, then load the chosen one.
+                                {
+                                    let h = history.lock().unwrap_or_else(|e| e.into_inner());
+                                    if let Some(cur) = &chat_id {
+                                        browserdata::save_chat(&config_dir(), cur, &h);
+                                    }
+                                }
+                                if let Some(msgs) = browserdata::load_chat(&config_dir(), id) {
+                                    let (transcript, used) = {
+                                        let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
+                                        *h = msgs;
+                                        (deuri::transcript(&h), deuri::history_tokens(&h) as u64)
+                                    };
+                                    chat_id = Some(id.to_string());
+                                    if let Some(p) = &panel {
+                                        let ctx = deuri::Settings::load(&config_dir()).context_length;
+                                        let v = json!({"t": "history", "msgs": transcript, "used": used, "ctx": ctx});
+                                        let _ = p.evaluate_script(&format!("window.deuriEvent&&window.deuriEvent({v})"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "delchat" => {
+                        if let Some(id) = cmd["id"].as_str() {
+                            browserdata::delete_chat(&config_dir(), id);
+                            if chat_id.as_deref() == Some(id) {
+                                history.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                                chat_id = None;
+                                if let Some(p) = &panel {
+                                    let v = json!({"t": "history", "msgs": [], "used": 0, "ctx": 0});
+                                    let _ = p.evaluate_script(&format!("window.deuriEvent&&window.deuriEvent({v})"));
+                                }
+                            }
+                            if let Some(p) = &panel {
+                                let list = browserdata::list_chats(&config_dir());
+                                let v = json!({"t": "chats", "list": list, "current": chat_id});
                                 let _ = p.evaluate_script(&format!("window.deuriEvent&&window.deuriEvent({v})"));
                             }
                         }
@@ -1134,6 +1484,11 @@ fn main() {
             Event::UserEvent(Msg::Deuri(ev)) => {
                 if matches!(ev, deuri::Event::Done { .. } | deuri::Event::Error(_)) {
                     deuri_busy = false;
+                    // Persist the conversation after each completed turn.
+                    if let Some(id) = &chat_id {
+                        let h = history.lock().unwrap_or_else(|e| e.into_inner());
+                        browserdata::save_chat(&config_dir(), id, &h);
+                    }
                 }
                 if let Some(p) = &panel {
                     let _ = p.evaluate_script(&event_js(&ev));
@@ -1200,7 +1555,7 @@ fn main() {
                     }
                 }
                 "go" => {
-                    if let (Some(url), Some(t)) = (resolve_input(&text), tabs.iter_mut().find(|t| t.id == active)) {
+                    if let (Some(url), Some(t)) = (resolve_input(&text, settings.search_base()), tabs.iter_mut().find(|t| t.id == active)) {
                         t.label = None;
                         t.url = url.clone();
                         t.loading = true;
@@ -1220,10 +1575,16 @@ fn main() {
                     }
                 }
                 "newwindow" => spawn_new_window(),
-                "extensions" => {
-                    let page = extensions_page(&loaded_exts, &extensions::dir(&config_dir()));
-                    let start = Start::Html { html: page, label: EXT_URL };
-                    if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, &page_init, next_id, start, content_bounds(&window, panel_open)) {
+                "extensions" | "history" | "settings" => {
+                    let (page, label) = match cmd["c"].as_str() {
+                        Some("history") => (history_page(&config_dir()), HISTORY_URL),
+                        Some("settings") => {
+                            (settings_page(&settings, &deuri::Settings::load(&config_dir())), SETTINGS_URL)
+                        }
+                        _ => (extensions_page(&loaded_exts, &extensions::dir(&config_dir())), EXT_URL),
+                    };
+                    let start = Start::Html { html: page, label };
+                    if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, &block_trackers, &page_init, next_id, start, content_bounds(&window, panel_open)) {
                         active = t.id;
                         tabs.push(t);
                         next_id += 1;
@@ -1237,12 +1598,10 @@ fn main() {
                         continue;
                     }
                     let blank = text.is_empty();
-                    let start = if blank {
-                        Start::Html { html: start_html.clone(), label: START_URL }
-                    } else {
-                        Start::Url(text.clone())
-                    };
-                    if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, &page_init, next_id, start, content_bounds(&window, panel_open)) {
+                    let start = if blank { home_start(&settings, &start_html) } else { Start::Url(text.clone()) };
+                    // Focus the address bar only on the beach/blank start page.
+                    let blank = blank && !settings.homepage.starts_with("http");
+                    if let Ok(t) = open_tab(&window, &mut context, &proxy, &blocked, &block_trackers, &page_init, next_id, start, content_bounds(&window, panel_open)) {
                         active = t.id;
                         tabs.push(t);
                         next_id += 1;
@@ -1325,15 +1684,16 @@ mod tests {
 
     #[test]
     fn address_bar_input() {
-        assert_eq!(resolve_input("example.com").as_deref(), Some("https://example.com"));
-        assert_eq!(resolve_input("example.com/a?b=1").as_deref(), Some("https://example.com/a?b=1"));
-        assert_eq!(resolve_input("https://x.test/p").as_deref(), Some("https://x.test/p"));
-        assert_eq!(resolve_input("localhost:3000/app").as_deref(), Some("http://localhost:3000/app"));
-        assert_eq!(resolve_input("127.0.0.1:8080").as_deref(), Some("http://127.0.0.1:8080"));
-        assert_eq!(resolve_input("rust borrow checker").as_deref(), Some("https://duckduckgo.com/?q=rust+borrow+checker"));
-        assert_eq!(resolve_input("what is 2.5 + 2").as_deref(), Some("https://duckduckgo.com/?q=what+is+2.5+%2B+2"));
-        assert_eq!(resolve_input("cats").as_deref(), Some("https://duckduckgo.com/?q=cats"));
-        assert_eq!(resolve_input("   "), None);
+        let d = SEARCH_URL;
+        assert_eq!(resolve_input("example.com", d).as_deref(), Some("https://example.com"));
+        assert_eq!(resolve_input("example.com/a?b=1", d).as_deref(), Some("https://example.com/a?b=1"));
+        assert_eq!(resolve_input("https://x.test/p", d).as_deref(), Some("https://x.test/p"));
+        assert_eq!(resolve_input("localhost:3000/app", d).as_deref(), Some("http://localhost:3000/app"));
+        assert_eq!(resolve_input("127.0.0.1:8080", d).as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(resolve_input("rust borrow checker", d).as_deref(), Some("https://duckduckgo.com/?q=rust+borrow+checker"));
+        assert_eq!(resolve_input("what is 2.5 + 2", "https://www.google.com/search?q=").as_deref(), Some("https://www.google.com/search?q=what+is+2.5+%2B+2"));
+        assert_eq!(resolve_input("cats", d).as_deref(), Some("https://duckduckgo.com/?q=cats"));
+        assert_eq!(resolve_input("   ", d), None);
     }
 
     #[test]

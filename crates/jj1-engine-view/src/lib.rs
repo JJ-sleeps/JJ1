@@ -1,6 +1,7 @@
 //! Shared pieces of JJ1's WebView layer, used by the agent worker (`jj1-view`)
 //! and the human-facing browser (`jj1-browser`).
 
+pub mod browserdata;
 pub mod deuri;
 pub mod extensions;
 pub mod screenshot;

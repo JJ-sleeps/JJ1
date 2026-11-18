@@ -368,6 +368,36 @@ installed here); no streaming of the model's hidden "thinking" tokens (shown as
 reply budget (`max_reply_tokens`, 3000) counts thinking tokens, so a long
 chain of thought can exhaust it (handled with a clear message, not a hang).
 
+### 2026-11-18 - Chat/browsing history, settings, UI polish
+
+- **Delete fixed.** Deleting a Deuri message used to remove the whole
+  question-and-answer exchange; now it removes just that one message and
+  repairs the history so it stays valid for the model (orphaned tool
+  results and dangling tool-call messages are dropped). Verified: deleting
+  a reply left its question in place and freed only its tokens (753 -> 235).
+- **Deuri chat history.** Conversations are saved to `%APPDATA%\jj1\chats\`
+  after each turn and after edits. A clock button in the panel opens a
+  "Past chats" list; clicking one reloads it, each has a delete button, and
+  "+ New" saves the current chat and starts a fresh one.
+- **Browsing history.** Visits are recorded to `history.json` (newest kept,
+  capped at 5000, built-in pages skipped). `jj1://history` lists them with
+  search, click-to-open and "Clear all". A clock icon in the toolbar opens it.
+- **Settings page** (`jj1://settings`, gear icon): search engine
+  (DuckDuckGo/Google/Bing/Brave), homepage (beach / blank / a URL), block
+  trackers, save history, clear history, clear cookies & site data, and
+  Deuri's model config (model, context length, GPU offload ratio, K/V cache
+  quant, flash attention, idle unload, max reply tokens). Browser prefs live
+  in `browser.json`; they take effect live (tracker toggle) or on the next
+  navigation / model load.
+- **UI.** More translucent frosted chrome; the Deuri panel modernized with
+  glassy bot bubbles, a gradient user bubble and message animations; the two
+  loose toolbar icons replaced by History / Extensions / Settings icons (a
+  dropdown menu was tried but a child WebView can't overflow its 80px bounds).
+
+New module `browserdata.rs` (settings, history, chats), unit-tested. The
+single-message delete and sanitize are unit-tested in `deuri.rs`. All work
+verified live by driving the real window. 52 unit + e2e tests pass.
+
 ### 2026-11-17 - Deuri: 100k context, cache quantization, deletable history
 
 Three changes, verified live against Bonsai 2:

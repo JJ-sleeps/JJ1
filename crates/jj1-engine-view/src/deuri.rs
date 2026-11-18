@@ -109,6 +109,12 @@ impl Settings {
         s
     }
 
+    /// Write the current settings to `deuri.json`.
+    pub fn save(&self, dir: &std::path::Path) {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join("deuri.json"), serde_json::to_string_pretty(&self.to_json()).unwrap_or_default());
+    }
+
     fn to_json(&self) -> Value {
         json!({
             "model": self.model, "identifier": self.identifier, "context_length": self.context_length,
@@ -385,29 +391,50 @@ pub fn transcript(history: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Delete the exchange the visible bubble `index` belongs to: its user message
-/// and every following assistant/tool message up to the next user message. The
-/// system message is never touched. Returns the new estimated token total, so
-/// the panel can show the tokens freed.
-pub fn delete_exchange(history: &mut Vec<Value>, index: usize) -> u64 {
+/// Delete the single visible message `index` (one bubble, not the whole turn).
+/// The system message is never removed. The history is then repaired so it
+/// stays valid for the model (no orphaned tool results, no tool requests whose
+/// results are gone). Returns the new estimated token total so the panel can
+/// show the tokens freed.
+pub fn delete_message(history: &mut Vec<Value>, index: usize) -> u64 {
     let target = history.iter().enumerate().filter(|(_, m)| is_bubble(m)).nth(index).map(|(i, _)| i);
     if let Some(i) = target {
-        // Walk back to the user message that opened this turn.
-        let mut start = i;
-        while start > 1 && history[start]["role"] != "user" {
-            start -= 1;
-        }
-        // Only delete a clean turn that starts at a user message (never the
-        // system message at index 0).
-        if start >= 1 && history[start]["role"] == "user" {
-            let mut end = start + 1;
-            while end < history.len() && history[end]["role"] != "user" {
-                end += 1;
-            }
-            history.drain(start..end);
+        if i >= 1 {
+            history.remove(i);
+            sanitize(history);
         }
     }
     history_tokens(history) as u64
+}
+
+/// Keep the conversation valid after an edit: drop `tool` results whose
+/// request is gone, and drop assistant tool-call messages that have no visible
+/// text and no surviving results.
+fn sanitize(history: &mut Vec<Value>) {
+    use std::collections::HashSet;
+    let requested: HashSet<String> = history
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .filter_map(|m| m["tool_calls"].as_array())
+        .flatten()
+        .filter_map(|c| c["id"].as_str().map(str::to_string))
+        .collect();
+    let answered: HashSet<String> = history
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["tool_call_id"].as_str().map(str::to_string))
+        .collect();
+    history.retain(|m| match m["role"].as_str().unwrap_or("") {
+        "tool" => m["tool_call_id"].as_str().is_some_and(|id| requested.contains(id)),
+        "assistant" => match m["tool_calls"].as_array() {
+            Some(calls) => {
+                !m["content"].as_str().unwrap_or("").is_empty()
+                    || calls.iter().any(|c| c["id"].as_str().is_some_and(|id| answered.contains(id)))
+            }
+            None => true,
+        },
+        _ => true,
+    });
 }
 
 /// Shrink the conversation to fit `budget` tokens. The system message (index
@@ -778,18 +805,52 @@ mod tests {
         assert_eq!(t[1], json!({"role": "bot", "text": "answer one"}));
         assert_eq!(t[3], json!({"role": "bot", "text": "answer two"}));
 
-        // Delete bubble 1 (bot "answer one") -> removes the whole first exchange
-        // (user "one", its tool call, tool result, assistant answer), system kept.
-        delete_exchange(&mut h, 1);
+        // Delete just bubble 1 (bot "answer one"). The user question "one" and
+        // the two other bubbles stay. The now-dangling tool scaffolding for the
+        // first turn (empty assistant tool_calls + its tool result) is kept only
+        // because the result is still referenced... here the final answer is
+        // gone, so sanitize drops the empty assistant, but the tool result keeps
+        // its matching request, so it stays. Transcript loses only "answer one".
+        delete_message(&mut h, 1);
+        let t = transcript(&h);
+        assert_eq!(
+            t,
+            vec![
+                json!({"role": "me", "text": "one"}),
+                json!({"role": "me", "text": "two"}),
+                json!({"role": "bot", "text": "answer two"})
+            ]
+        );
+        assert_eq!(h[0]["role"], "system");
+
+        // Delete the user bubble "one" (now index 0). Only that message goes.
+        delete_message(&mut h, 0);
         let t = transcript(&h);
         assert_eq!(t, vec![json!({"role": "me", "text": "two"}), json!({"role": "bot", "text": "answer two"})]);
         assert_eq!(h[0]["role"], "system");
-        assert_eq!(h.len(), 3);
 
-        // Delete the remaining exchange by its user bubble (index 0).
-        delete_exchange(&mut h, 0);
+        // Deleting the last two leaves only the system message.
+        delete_message(&mut h, 1);
+        delete_message(&mut h, 0);
         assert_eq!(transcript(&h).len(), 0);
-        assert_eq!(h.len(), 1);
         assert_eq!(h[0]["role"], "system");
+    }
+
+    #[test]
+    fn sanitize_drops_orphans() {
+        // An assistant tool-call with no visible text whose result was removed
+        // is dropped; a tool result whose request is gone is dropped.
+        let mut h = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "x"}]}),
+            json!({"role": "tool", "tool_call_id": "y", "content": "orphan result"}),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+        sanitize(&mut h);
+        // The empty tool-call assistant (no result) and the orphan tool both go.
+        let roles: Vec<&str> = h.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
+        assert_eq!(h[2]["content"], "done");
     }
 }

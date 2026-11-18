@@ -75,6 +75,9 @@ much memory as Edge does; the lightweight part of JJ1 is the agent side.
 
 - **Ctrl+N** opens a new window, **Ctrl+T** a new tab, **Ctrl+W** closes one,
   **Ctrl+L** the address bar, **Ctrl+J** Deuri.
+- The toolbar icons open your **History**, **Extensions** and **Settings**.
+  Settings cover the search engine, homepage, tracker blocking, clearing
+  history and site data, and Deuri's model config.
 
 ### Extensions
 
@@ -93,9 +96,10 @@ and open pages, all in your active tab.
 
 The model is loaded **only when you send your first message** (not when the
 browser starts), and unloaded when it sits idle or when you close the browser.
-Each message has a **delete button** — removing one drops that whole exchange
+Each message has a **delete button** — removing one drops just that message
 from the context, so you get its tokens back (the meter at the bottom shows how
-much of the window is used).
+much of the window is used). The clock button opens your **past chats**:
+conversations are saved on this computer and you can reopen or delete them.
 
 Settings live in `%APPDATA%\jj1\deuri.json`. Deuri loads the model with a
 **100k-token context**, **q8_0 K/V cache quantization** (with flash attention),
